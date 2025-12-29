@@ -38,7 +38,8 @@ const createDefaultForm = (isLivestock) => ({
 const toQuantityMap = (items, existing = {}) => {
   const map = {};
   items.forEach((item) => {
-    map[item.id] = existing[item.id] ?? 0;
+    const isAvailable = item.available !== false;
+    map[item.id] = isAvailable ? existing[item.id] ?? 0 : 0;
   });
   return map;
 };
@@ -85,7 +86,8 @@ export default function OrderForm({ variant = "eggs" }) {
               docData.specialPrice === undefined ? null : Number(docData.specialPrice),
             order: docData.order ?? 0,
             categoryId: docData.categoryId ?? "",
-            categoryName: docData.categoryName ?? docData.category ?? ""
+            categoryName: docData.categoryName ?? docData.category ?? "",
+            available: docData.available !== false
           };
         });
         setItems(data);
@@ -168,7 +170,10 @@ export default function OrderForm({ variant = "eggs" }) {
   }, [form.deliveryOption, isLivestock]);
 
   const selectedItems = useMemo(
-    () => items.filter((item) => (quantities[item.id] ?? 0) > 0),
+    () =>
+      items.filter(
+        (item) => item.available !== false && (quantities[item.id] ?? 0) > 0
+      ),
     [items, quantities]
   );
 
@@ -460,36 +465,49 @@ export default function OrderForm({ variant = "eggs" }) {
                       </div>
                     </div>
                     <div className="grid gap-3 md:grid-cols-2">
-                      {group.items.map((item) => (
-                        <div
-                          key={item.id}
-                          className="rounded-lg border border-brandGreen/15 bg-brandBeige/40 p-3 shadow-sm"
-                        >
-                          <div className="flex justify-between gap-3">
-                            <div>
-                              <p className="font-semibold text-brandGreen">{item.label}</p>
-                              <p className="text-sm text-brandGreen/70">
-                                Normal: R{item.price.toFixed(2)}
-                                {item.specialPrice !== null && item.specialPrice !== undefined
-                                  ? ` \u00b7 Special: R${item.specialPrice.toFixed(2)}`
-                                  : ""}
-                              </p>
+                      {group.items.map((item) => {
+                        const isAvailable = item.available !== false;
+                        return (
+                          <div
+                            key={item.id}
+                            className={`rounded-lg border border-brandGreen/15 bg-brandBeige/40 p-3 shadow-sm ${
+                              isAvailable ? "" : "opacity-60"
+                            }`}
+                          >
+                            <div className="flex justify-between gap-3">
+                              <div>
+                                <p className="font-semibold text-brandGreen">{item.label}</p>
+                                <p className="text-sm text-brandGreen/70">
+                                  Normal: R{item.price.toFixed(2)}
+                                  {item.specialPrice !== null && item.specialPrice !== undefined
+                                    ? ` \u00b7 Special: R${item.specialPrice.toFixed(2)}`
+                                    : ""}
+                                </p>
+                                {!isAvailable ? (
+                                  <p className="text-xs font-semibold text-brandGreen/60">
+                                    Unavailable
+                                  </p>
+                                ) : null}
+                              </div>
+                              <input
+                                type="number"
+                                min={0}
+                                disabled={!isAvailable}
+                                className={`w-24 rounded-lg border border-brandGreen/30 px-3 py-2 text-right font-semibold text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30 ${
+                                  isAvailable ? "bg-brandCream" : "bg-gray-100 text-brandGreen/50"
+                                }`}
+                                value={quantities[item.id] ?? 0}
+                                onChange={(event) =>
+                                  setQuantities((prev) => ({
+                                    ...prev,
+                                    [item.id]: Math.max(0, Number(event.target.value))
+                                  }))
+                                }
+                              />
                             </div>
-                            <input
-                              type="number"
-                              min={0}
-                              className="w-24 rounded-lg border border-brandGreen/30 bg-brandCream px-3 py-2 text-right font-semibold text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
-                              value={quantities[item.id] ?? 0}
-                              onChange={(event) =>
-                                setQuantities((prev) => ({
-                                  ...prev,
-                                  [item.id]: Math.max(0, Number(event.target.value))
-                                }))
-                              }
-                            />
                           </div>
-                        </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 ))
@@ -502,36 +520,49 @@ export default function OrderForm({ variant = "eggs" }) {
                   No egg types found. Add some on the admin dashboard.
                 </div>
               ) : (
-                items.map((item) => (
-                  <div
-                    key={item.id}
-                    className="rounded-lg border border-brandGreen/15 bg-white/70 p-3 shadow-sm"
-                  >
-                    <div className="flex justify-between gap-3">
-                      <div>
-                        <p className="font-semibold text-brandGreen">{item.label}</p>
-                        <p className="text-sm text-brandGreen/70">
-                          Normal: R{item.price.toFixed(2)}
-                          {item.specialPrice !== null && item.specialPrice !== undefined
-                            ? ` \u00b7 Special: R${item.specialPrice.toFixed(2)}`
-                            : ""}
-                        </p>
+                items.map((item) => {
+                  const isAvailable = item.available !== false;
+                  return (
+                    <div
+                      key={item.id}
+                      className={`rounded-lg border border-brandGreen/15 bg-white/70 p-3 shadow-sm ${
+                        isAvailable ? "" : "opacity-60"
+                      }`}
+                    >
+                      <div className="flex justify-between gap-3">
+                        <div>
+                          <p className="font-semibold text-brandGreen">{item.label}</p>
+                          <p className="text-sm text-brandGreen/70">
+                            Normal: R{item.price.toFixed(2)}
+                            {item.specialPrice !== null && item.specialPrice !== undefined
+                              ? ` \u00b7 Special: R${item.specialPrice.toFixed(2)}`
+                              : ""}
+                          </p>
+                          {!isAvailable ? (
+                            <p className="text-xs font-semibold text-brandGreen/60">
+                              Unavailable
+                            </p>
+                          ) : null}
+                        </div>
+                        <input
+                          type="number"
+                          min={0}
+                          disabled={!isAvailable}
+                          className={`w-24 rounded-lg border border-brandGreen/30 px-3 py-2 text-right font-semibold text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30 ${
+                            isAvailable ? "bg-brandCream" : "bg-gray-100 text-brandGreen/50"
+                          }`}
+                          value={quantities[item.id] ?? 0}
+                          onChange={(event) =>
+                            setQuantities((prev) => ({
+                              ...prev,
+                              [item.id]: Math.max(0, Number(event.target.value))
+                            }))
+                          }
+                        />
                       </div>
-                      <input
-                        type="number"
-                        min={0}
-                        className="w-24 rounded-lg border border-brandGreen/30 bg-brandCream px-3 py-2 text-right font-semibold text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
-                        value={quantities[item.id] ?? 0}
-                        onChange={(event) =>
-                          setQuantities((prev) => ({
-                            ...prev,
-                            [item.id]: Math.max(0, Number(event.target.value))
-                          }))
-                        }
-                      />
                     </div>
-                  </div>
-                ))
+                  );
+                })
               )}
               <div className="space-y-2">
                 <label className="block text-sm font-semibold text-brandGreen">

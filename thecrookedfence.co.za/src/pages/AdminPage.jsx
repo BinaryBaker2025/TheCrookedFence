@@ -21,8 +21,10 @@ import { getDownloadURL, ref as storageRef, uploadBytes } from "firebase/storage
 import { auth, db, functions, storage } from "../lib/firebase.js";
 import {
   DEFAULT_DELIVERY_OPTIONS,
+  DEFAULT_EGG_TYPES,
   DEFAULT_FORM_DELIVERY_OPTIONS,
   DEFAULT_LIVESTOCK_DELIVERY_OPTIONS,
+  FINANCE_ATTACHMENTS,
   INVENTORY_SORT_OPTIONS,
   ORDER_STATUSES,
   STATUS_STYLES,
@@ -50,11 +52,21 @@ const formatDate = (value) => {
   return new Date(value).toLocaleDateString();
 };
 
+const formatCurrency = (value) => {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+  return `R${Number(value).toFixed(2)}`;
+};
+
 const extractCost = (label) => {
   if (!label) return 0;
   const match = label.match(/R\s*([\d.]+)/i);
   return match ? Number(match[1]) : 0;
 };
+
+const ORDER_ATTACHMENTS = FINANCE_ATTACHMENTS;
+
+const createLineId = () =>
+  `line_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
 const useAuthRole = () => {
   const [user, setUser] = useState(null);
@@ -196,10 +208,18 @@ function AdminDashboard({ user, role }) {
   const isWorker = role === "worker";
 
   const [activeTab, setActiveTab] = useState(isWorker ? "stock_updates" : "orders");
+  const [openMenu, setOpenMenu] = useState(null);
 
   useEffect(() => {
     if (isWorker) setActiveTab("stock_updates");
   }, [isWorker]);
+
+  useEffect(() => {
+    if (!openMenu) return undefined;
+    const handleClick = () => setOpenMenu(null);
+    document.addEventListener("click", handleClick);
+    return () => document.removeEventListener("click", handleClick);
+  }, [openMenu]);
 
   const [eggOrders, setEggOrders] = useState([]);
   const [livestockOrders, setLivestockOrders] = useState([]);
@@ -219,6 +239,7 @@ function AdminDashboard({ user, role }) {
   const [paidFilter, setPaidFilter] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
   const [sortKey, setSortKey] = useState("orderNumberDesc");
+  const [orderActionMessage, setOrderActionMessage] = useState("");
 
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [selectedOrderCollection, setSelectedOrderCollection] = useState("eggOrders");
@@ -470,10 +491,28 @@ function AdminDashboard({ user, role }) {
     [livestockOrders, deliveryLookup]
   );
 
+  const resolvedEggDeliveryOptions =
+    deliveryOptions.length > 0 ? deliveryOptions : DEFAULT_FORM_DELIVERY_OPTIONS;
+  const resolvedLivestockDeliveryOptions =
+    livestockDeliveryOptions.length > 0
+      ? livestockDeliveryOptions
+      : DEFAULT_LIVESTOCK_DELIVERY_OPTIONS;
+  const resolvedEggTypes = eggTypes.length > 0 ? eggTypes : DEFAULT_EGG_TYPES;
+
   const applyOrderFilters = (orders) => {
     return orders
       .filter((order) => {
-        if (statusFilter !== "all" && order.orderStatus !== statusFilter) return false;
+        if (statusFilter === "all") {
+          if (
+            order.orderStatus === "completed" ||
+            order.orderStatus === "archived" ||
+            order.orderStatus === "cancelled"
+          ) {
+            return false;
+          }
+        } else if (order.orderStatus !== statusFilter) {
+          return false;
+        }
         if (paidFilter === "paid" && !order.paid) return false;
         if (paidFilter === "unpaid" && order.paid) return false;
         if (!searchTerm.trim()) return true;
@@ -525,6 +564,16 @@ function AdminDashboard({ user, role }) {
     () => applyOrderFilters(enrichedLivestockOrders),
     [enrichedLivestockOrders, statusFilter, paidFilter, searchTerm, sortKey]
   );
+
+  useEffect(() => {
+    if (!selectedOrder) return;
+    const source =
+      selectedOrderCollection === "livestockOrders"
+        ? enrichedLivestockOrders
+        : enrichedEggOrders;
+    const updated = source.find((item) => item.id === selectedOrder.id);
+    if (updated && updated !== selectedOrder) setSelectedOrder(updated);
+  }, [selectedOrder, selectedOrderCollection, enrichedEggOrders, enrichedLivestockOrders]);
 
   const stockCategoryOptions = useMemo(() => {
     const options = stockCategories.map((category) => ({
@@ -630,13 +679,29 @@ function AdminDashboard({ user, role }) {
         label: eggDraft.label.trim(),
         price: Number(eggDraft.price),
         specialPrice: eggDraft.specialPrice ? Number(eggDraft.specialPrice) : null,
-        order: eggTypes.length + 1
+        order: eggTypes.length + 1,
+        available: true
       });
       setEggDraft({ label: "", price: "", specialPrice: "" });
       setEggMessage("Egg type added.");
     } catch (err) {
       console.error("add egg type error", err);
       setEggError("Unable to add egg type.");
+    }
+  };
+
+  const handleToggleEggAvailability = async (item) => {
+    setEggError("");
+    setEggMessage("");
+    const nextAvailable = item.available === false;
+    try {
+      await updateDoc(doc(db, "eggTypes", item.id), { available: nextAvailable });
+      setEggMessage(
+        nextAvailable ? "Egg type marked available." : "Egg type marked unavailable."
+      );
+    } catch (err) {
+      console.error("toggle egg availability error", err);
+      setEggError("Unable to update availability.");
     }
   };
 
@@ -1012,21 +1077,79 @@ function AdminDashboard({ user, role }) {
     }
   };
 
+  const handleSendDispatchEmail = async (collectionName, order) => {
+    try {
+      const callable = httpsCallable(functions, "sendDispatchEmail");
+      await callable({ collectionName, orderId: order.id });
+    } catch (err) {
+      console.error("send dispatch email error", err);
+      throw err;
+    }
+  };
+
   const handleLogout = async () => {
     await signOut(auth);
   };
 
+  const showOrderActionMessage = (message) => {
+    setOrderActionMessage(message);
+    window.setTimeout(() => setOrderActionMessage(""), 2500);
+  };
+
+  const getActiveFormLink = () => {
+    const path = activeTab === "livestock_orders" ? "/livestock" : "/eggs";
+    if (typeof window === "undefined") return path;
+    return `${window.location.origin}${path}`;
+  };
+
+  const handleCopyFormLink = async () => {
+    const link = getActiveFormLink();
+    try {
+      await navigator.clipboard.writeText(link);
+      showOrderActionMessage("Form link copied.");
+    } catch (err) {
+      console.warn("copy form link failed", err);
+      window.prompt("Copy form link:", link);
+    }
+  };
+
+  const handleShareFormLink = () => {
+    const link = getActiveFormLink();
+    const text = `Order form: ${link}`;
+    const shareUrl = `https://wa.me/?text=${encodeURIComponent(text)}`;
+    window.open(shareUrl, "_blank", "noopener,noreferrer");
+  };
+
   const activeOrders = activeTab === "livestock_orders" ? filteredLivestockOrders : filteredEggOrders;
-  const activeOrderTitle = activeTab === "livestock_orders" ? "Livestock Orders" : "Egg Orders";
+  const activeOrderTitle =
+    activeTab === "livestock_orders" ? "Live Livestock Orders" : "Live Egg Orders";
   const activeOrderCollection = activeTab === "livestock_orders" ? "livestockOrders" : "eggOrders";
+  const activeItemLabel = activeTab === "livestock_orders" ? "Livestock" : "Eggs";
+  const modalDeliveryOptions =
+    selectedOrderCollection === "livestockOrders"
+      ? resolvedLivestockDeliveryOptions
+      : resolvedEggDeliveryOptions;
+  const modalItemOptions =
+    selectedOrderCollection === "livestockOrders" ? livestockTypes : resolvedEggTypes;
+  const isOrdersActive = activeTab === "orders" || activeTab === "livestock_orders";
+  const isTypesActive = activeTab === "eggs" || activeTab === "livestock_types";
+  const canSeeTypes = isAdmin;
+  const toggleMenu = (menuId) =>
+    setOpenMenu((prev) => (prev === menuId ? null : menuId));
+
+  const orderTabs = [
+    { id: "orders", label: "Egg orders" },
+    { id: "livestock_orders", label: "Livestock orders" }
+  ];
+
+  const typeTabs = [
+    { id: "eggs", label: "Egg types", adminOnly: true },
+    { id: "livestock_types", label: "Livestock types", adminOnly: true }
+  ];
 
   const tabs = [
-    { id: "orders", label: "Orders" },
-    { id: "livestock_orders", label: "Livestock Orders" },
-    { id: "eggs", label: "Egg types", adminOnly: true },
     { id: "delivery", label: "Delivery methods", adminOnly: true },
     { id: "livestock_delivery", label: "Livestock delivery", adminOnly: true },
-    { id: "livestock_types", label: "Livestock types", adminOnly: true },
     { id: "inventory", label: "Inventory" },
     { id: "stock_logs", label: "Stock logs" },
     { id: "stock_updates", label: "Stock updates" },
@@ -1055,6 +1178,84 @@ function AdminDashboard({ user, role }) {
       </div>
 
       <div className="flex flex-wrap gap-2">
+        <div className="relative" onClick={(event) => event.stopPropagation()}>
+          <button
+            type="button"
+            onClick={() => toggleMenu("orders")}
+            aria-haspopup="menu"
+            aria-expanded={openMenu === "orders"}
+            className={`rounded-full px-4 py-2 text-sm font-semibold shadow-sm transition ${
+              isOrdersActive
+                ? "bg-brandGreen text-white"
+                : "bg-white text-brandGreen border border-brandGreen/30"
+            }`}
+          >
+            Orders ▾
+          </button>
+          {openMenu === "orders" ? (
+            <div className="absolute left-0 z-20 mt-2 w-56 rounded-2xl border border-brandGreen/20 bg-white p-2 shadow-xl">
+              {orderTabs.map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    setActiveTab(tab.id);
+                    setOpenMenu(null);
+                  }}
+                  className={`w-full rounded-full px-3 py-2 text-left text-sm font-semibold transition ${
+                    activeTab === tab.id
+                      ? "bg-brandGreen text-white"
+                      : "text-brandGreen hover:bg-brandBeige"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
+        </div>
+
+        {canSeeTypes ? (
+          <div className="relative" onClick={(event) => event.stopPropagation()}>
+            <button
+              type="button"
+              onClick={() => toggleMenu("types")}
+              aria-haspopup="menu"
+              aria-expanded={openMenu === "types"}
+              className={`rounded-full px-4 py-2 text-sm font-semibold shadow-sm transition ${
+                isTypesActive
+                  ? "bg-brandGreen text-white"
+                  : "bg-white text-brandGreen border border-brandGreen/30"
+              }`}
+            >
+              Types ▾
+            </button>
+            {openMenu === "types" ? (
+              <div className="absolute left-0 z-20 mt-2 w-56 rounded-2xl border border-brandGreen/20 bg-white p-2 shadow-xl">
+                {typeTabs
+                  .filter((tab) => !tab.adminOnly || isAdmin)
+                  .map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      onClick={() => {
+                        setActiveTab(tab.id);
+                        setOpenMenu(null);
+                      }}
+                      className={`w-full rounded-full px-3 py-2 text-left text-sm font-semibold transition ${
+                        activeTab === tab.id
+                          ? "bg-brandGreen text-white"
+                          : "text-brandGreen hover:bg-brandBeige"
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
         {tabs
           .filter((tab) => !tab.adminOnly || isAdmin)
           .map((tab) => (
@@ -1087,6 +1288,30 @@ function AdminDashboard({ user, role }) {
               <div className="rounded-full bg-white/70 px-4 py-2 shadow-inner">
                 Total orders: <span className="font-semibold">{activeOrders.length}</span>
               </div>
+            </div>
+          </div>
+
+          <div className={panelClass}>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleCopyFormLink}
+                className="rounded-full bg-brandGreen px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:shadow-md"
+              >
+                Copy form link
+              </button>
+              <button
+                type="button"
+                onClick={handleShareFormLink}
+                className="rounded-full border border-brandGreen/30 px-4 py-2 text-sm font-semibold text-brandGreen shadow-sm transition hover:bg-brandBeige"
+              >
+                Share form on WhatsApp
+              </button>
+              {orderActionMessage ? (
+                <span className="text-xs font-semibold text-brandGreen/70">
+                  {orderActionMessage}
+                </span>
+              ) : null}
             </div>
           </div>
 
@@ -1158,120 +1383,208 @@ function AdminDashboard({ user, role }) {
             </div>
           </div>
 
-          <div className="overflow-x-auto rounded-2xl border border-brandGreen/10">
-            <table className="w-full min-w-[1500px] text-left text-sm text-brandGreen">
-              <thead className="bg-brandGreen text-white">
-                <tr>
-                  <th className="px-4 py-3 font-semibold">Date</th>
-                  <th className="px-4 py-3 font-semibold">Order #</th>
-                  <th className="px-4 py-3 font-semibold">Name</th>
-                  <th className="px-4 py-3 font-semibold">Email</th>
-                  <th className="px-4 py-3 font-semibold">Cellphone</th>
-                  <th className="px-4 py-3 font-semibold">Delivery</th>
-                  <th className="px-4 py-3 font-semibold">Status</th>
-                  <th className="px-4 py-3 font-semibold">Send date</th>
-                  <th className="px-4 py-3 font-semibold">Total</th>
-                  <th className="px-4 py-3 font-semibold">Paid</th>
-                  <th className="px-4 py-3 font-semibold text-right">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {activeOrders.length === 0 && (
+          <div className="space-y-3 md:hidden">
+            {activeOrders.length === 0 ? (
+              <div className="rounded-2xl border border-brandGreen/10 bg-white/70 p-4 text-center text-sm text-brandGreen/70 shadow-inner">
+                No orders match your filters.
+              </div>
+            ) : (
+              activeOrders.map((order) => (
+                <div
+                  key={order.id}
+                  className="space-y-3 rounded-2xl border border-brandGreen/10 bg-white/70 p-4 shadow-inner"
+                  onClick={() => {
+                    setSelectedOrder(order);
+                    setSelectedOrderCollection(activeOrderCollection);
+                  }}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="space-y-1">
+                      <p className="text-xs text-brandGreen/70">{formatDate(order.createdAtDate)}</p>
+                      <p className="text-xs font-mono text-brandGreen">
+                        {order.orderNumber || "-"}
+                      </p>
+                      <p className="font-semibold text-brandGreen">
+                        {order.name} {order.surname}
+                      </p>
+                      <p className="text-xs text-brandGreen/70">
+                        {[order.email, order.cellphone].filter(Boolean).join(" · ")}
+                      </p>
+                    </div>
+                    <div className="flex flex-col items-end gap-2">
+                      <span
+                        className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold capitalize ${
+                          STATUS_STYLES[order.orderStatus] || "bg-gray-100 text-gray-800"
+                        }`}
+                      >
+                        {order.orderStatus}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setSelectedOrder(order);
+                          setSelectedOrderCollection(activeOrderCollection);
+                        }}
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-brandGreen text-white shadow-sm transition hover:shadow-md"
+                        aria-label="View order"
+                      >
+                        ...
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-1 text-sm text-brandGreen">
+                    <p className="font-semibold">
+                      Delivery: {order.deliveryOption ?? "-"}
+                    </p>
+                    <p>Send date: {order.sendDate ?? "-"}</p>
+                    <p className="font-semibold">Total: {formatCurrency(order.totalCost)}</p>
+                    <p>
+                      {activeItemLabel}: {order.eggSummary || "-"}
+                    </p>
+                    <p>
+                      <span className="font-semibold">Paid:</span>{" "}
+                      {order.paid ? "Yes" : "No"}
+                    </p>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="hidden md:block">
+            <div className="overflow-x-auto rounded-2xl border border-brandGreen/10">
+              <table className="w-full min-w-[1500px] text-left text-sm text-brandGreen">
+                <thead className="bg-brandGreen text-white">
                   <tr>
-                    <td colSpan={11} className="px-4 py-6 text-center text-brandGreen/70">
-                      No orders match your filters.
-                    </td>
+                    <th className="px-4 py-3 font-semibold">Date</th>
+                    <th className="px-4 py-3 font-semibold">Order #</th>
+                    <th className="px-4 py-3 font-semibold">Name</th>
+                    <th className="px-4 py-3 font-semibold">Email</th>
+                    <th className="px-4 py-3 font-semibold">Cellphone</th>
+                    <th className="px-4 py-3 font-semibold">Delivery</th>
+                    <th className="px-4 py-3 font-semibold">Status</th>
+                    <th className="px-4 py-3 font-semibold">Send date</th>
+                    <th className="px-4 py-3 font-semibold">Total</th>
+                    <th className="px-4 py-3 font-semibold">Paid</th>
+                    <th className="px-4 py-3 font-semibold text-right">Actions</th>
                   </tr>
-                )}
-                {activeOrders.map((order, index) => {
-                  const rowClass = index % 2 === 0 ? "bg-white" : "bg-brandBeige/60";
-                  return (
-                    <tr key={order.id} className={`${rowClass} transition`}
-                      onClick={() => {
-                        setSelectedOrder(order);
-                        setSelectedOrderCollection(activeOrderCollection);
-                      }}
-                    >
-                      <td className="px-4 py-3 align-top">{formatDate(order.createdAtDate)}</td>
-                      <td className="px-4 py-3 align-top font-mono">{order.orderNumber || "-"}</td>
-                      <td className="px-4 py-3 align-top">
-                        <div className="font-semibold">
-                          {order.name} {order.surname}
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 align-top">
-                        <a
-                          href={`mailto:${order.email}`}
-                          onClick={(event) => event.stopPropagation()}
-                          className="text-brandGreen underline decoration-brandGreen/50 decoration-1 underline-offset-2"
-                        >
-                          {order.email}
-                        </a>
-                      </td>
-                      <td className="px-4 py-3 align-top">
-                        <a
-                          href={`tel:${order.cellphone}`}
-                          onClick={(event) => event.stopPropagation()}
-                          className="text-brandGreen"
-                        >
-                          {order.cellphone}
-                        </a>
-                      </td>
-                      <td className="px-4 py-3 align-top">{order.deliveryOption ?? "-"}</td>
-                      <td className="px-4 py-3 align-top">
-                        <span
-                          className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold capitalize ${
-                            STATUS_STYLES[order.orderStatus] || "bg-gray-100 text-gray-800"
-                          }`}
-                        >
-                          {order.orderStatus}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 align-top">{order.sendDate ?? "-"}</td>
-                      <td className="px-4 py-3 align-top font-semibold">
-                        {order.totalCost ? `R${order.totalCost.toFixed(2)}` : "-"}
-                      </td>
-                      <td className="px-4 py-3 align-top">
-                        <span
-                          className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold ${
-                            order.paid
-                              ? "bg-emerald-100 text-emerald-800 border border-emerald-200"
-                              : "bg-amber-100 text-amber-800 border border-amber-200"
-                          }`}
-                        >
-                          {order.paid ? "Paid" : "Unpaid"}
-                        </span>
-                      </td>
-                      <td className="px-4 py-3 align-top text-right">
-                        <div className="flex justify-end gap-2">
-                          <button
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              setSelectedOrder(order);
-                              setSelectedOrderCollection(activeOrderCollection);
-                            }}
-                            className="rounded-full bg-brandGreen px-3 py-1 text-xs font-semibold text-white shadow-sm transition hover:shadow-md"
-                          >
-                            View
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              handlePaidToggle(activeOrderCollection, order);
-                            }}
-                            className="rounded-full border border-brandGreen/30 px-3 py-1 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
-                          >
-                            {order.paid ? "Mark unpaid" : "Mark paid"}
-                          </button>
-                        </div>
+                </thead>
+                <tbody>
+                  {activeOrders.length === 0 && (
+                    <tr>
+                      <td colSpan={11} className="px-4 py-6 text-center text-brandGreen/70">
+                        No orders match your filters.
                       </td>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                  )}
+                  {activeOrders.map((order, index) => {
+                    const rowClass = index % 2 === 0 ? "bg-white" : "bg-brandBeige/60";
+                    const internalNote =
+                      typeof order.internalNote === "string" ? order.internalNote.trim() : "";
+                    const noteTitle = internalNote
+                      ? `Internal note: ${internalNote.replace(/\s+/g, " ")}`
+                      : "";
+                    return (
+                      <tr
+                        key={order.id}
+                        className={`${rowClass} transition cursor-pointer`}
+                        onClick={() => {
+                          setSelectedOrder(order);
+                          setSelectedOrderCollection(activeOrderCollection);
+                        }}
+                      >
+                        <td className="px-4 py-3 align-top">
+                          {formatDate(order.createdAtDate)}
+                        </td>
+                        <td className="px-4 py-3 align-top font-mono">
+                          {order.orderNumber || "-"}
+                        </td>
+                        <td className="px-4 py-3 align-top">
+                          <div className="font-semibold">
+                            {order.name} {order.surname}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 align-top">
+                          <a
+                            href={`mailto:${order.email}`}
+                            onClick={(event) => event.stopPropagation()}
+                            className="text-brandGreen underline decoration-brandGreen/50 decoration-1 underline-offset-2"
+                          >
+                            {order.email}
+                          </a>
+                        </td>
+                        <td className="px-4 py-3 align-top">
+                          <a
+                            href={`tel:${order.cellphone}`}
+                            onClick={(event) => event.stopPropagation()}
+                            className="text-brandGreen"
+                          >
+                            {order.cellphone}
+                          </a>
+                        </td>
+                        <td className="px-4 py-3 align-top">{order.deliveryOption ?? "-"}</td>
+                        <td className="px-4 py-3 align-top">
+                          <span
+                            className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold capitalize ${
+                              STATUS_STYLES[order.orderStatus] || "bg-gray-100 text-gray-800"
+                            }`}
+                          >
+                            {order.orderStatus}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 align-top">{order.sendDate ?? "-"}</td>
+                        <td className="px-4 py-3 align-top font-semibold">
+                          {formatCurrency(order.totalCost)}
+                        </td>
+                        <td className="px-4 py-3 align-top">
+                          <span
+                            className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold ${
+                              order.paid
+                                ? "bg-emerald-100 text-emerald-800 border border-emerald-200"
+                                : "bg-amber-100 text-amber-800 border border-amber-200"
+                            }`}
+                          >
+                            {order.paid ? "Paid" : "Unpaid"}
+                          </span>
+                        </td>
+                        <td className="relative px-4 py-3 align-top text-right">
+                          <div className="flex items-center justify-end gap-2">
+                            {internalNote ? (
+                              <button
+                                type="button"
+                                title={noteTitle}
+                                aria-label="View internal note"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  setSelectedOrder(order);
+                                  setSelectedOrderCollection(activeOrderCollection);
+                                }}
+                                className="flex h-8 w-8 items-center justify-center rounded-full border border-brandGreen/30 bg-white text-brandGreen shadow-sm transition hover:bg-brandBeige"
+                              >
+                                i
+                              </button>
+                            ) : null}
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setSelectedOrder(order);
+                                setSelectedOrderCollection(activeOrderCollection);
+                              }}
+                              className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-brandGreen text-white shadow-sm transition hover:shadow-md"
+                              aria-label="View order"
+                            >
+                              ...
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
@@ -1346,8 +1659,14 @@ function AdminDashboard({ user, role }) {
                   price: item.price ?? 0,
                   specialPrice: item.specialPrice ?? ""
                 };
+                const isAvailable = item.available !== false;
                 return (
-                  <div key={item.id} className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
+                  <div
+                    key={item.id}
+                    className={`rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm ${
+                      isAvailable ? "" : "opacity-70"
+                    }`}
+                  >
                     <div className="grid gap-2 md:grid-cols-4">
                       <input
                         type="text"
@@ -1383,13 +1702,33 @@ function AdminDashboard({ user, role }) {
                         }
                         placeholder="Special price"
                       />
-                      <div className="flex gap-2 md:justify-end">
+                      <div className="flex flex-wrap gap-2 md:justify-end">
+                        <span
+                          className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
+                            isAvailable
+                              ? "bg-emerald-100 text-emerald-800 border border-emerald-200"
+                              : "bg-amber-100 text-amber-800 border border-amber-200"
+                          }`}
+                        >
+                          {isAvailable ? "Available" : "Unavailable"}
+                        </span>
                         <button
                           type="button"
                           onClick={() => handleSaveEggType(item.id)}
                           className="rounded-full bg-brandGreen px-3 py-1 text-xs font-semibold text-white shadow-sm transition hover:shadow-md"
                         >
                           Save
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleToggleEggAvailability(item)}
+                          className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
+                            isAvailable
+                              ? "border-amber-300 text-amber-800 hover:bg-amber-50"
+                              : "border-emerald-300 text-emerald-800 hover:bg-emerald-50"
+                          }`}
+                        >
+                          {isAvailable ? "Mark unavailable" : "Mark available"}
                         </button>
                         <button
                           type="button"
@@ -2367,6 +2706,12 @@ function AdminDashboard({ user, role }) {
         <OrderDetailModal
           order={selectedOrder}
           collectionName={selectedOrderCollection}
+          deliveryOptions={modalDeliveryOptions}
+          itemOptions={modalItemOptions}
+          onPaidToggle={(order) => handlePaidToggle(selectedOrderCollection, order)}
+          onSendDispatchEmail={(order) =>
+            handleSendDispatchEmail(selectedOrderCollection, order)
+          }
           onClose={() => setSelectedOrder(null)}
           onUpdate={(updates) =>
             handleOrderUpdate(selectedOrderCollection, selectedOrder.id, updates)
@@ -2503,20 +2848,265 @@ function DeliveryOptionsPanel({
   );
 }
 
-function OrderDetailModal({ order, collectionName, onClose, onUpdate, onDelete }) {
+function OrderDetailModal({
+  order,
+  collectionName,
+  deliveryOptions = [],
+  itemOptions = [],
+  onClose,
+  onUpdate,
+  onDelete,
+  onPaidToggle,
+  onSendDispatchEmail
+}) {
   const [draft, setDraft] = useState({
     orderStatus: order.orderStatus ?? "pending",
+    deliveryOptionId: order.deliveryOptionId ?? "",
+    sendDate: order.sendDate ?? "",
     trackingLink: order.trackingLink ?? "",
+    notes: order.notes ?? "",
     internalNote: order.internalNote ?? ""
   });
+  const [lineItems, setLineItems] = useState([]);
+  const [copyNotice, setCopyNotice] = useState("");
+  const [internalNoteMessage, setInternalNoteMessage] = useState("");
+  const [internalNoteSaving, setInternalNoteSaving] = useState(false);
+  const [trackingMessage, setTrackingMessage] = useState("");
+  const [trackingSaving, setTrackingSaving] = useState(false);
+  const [dispatchMessage, setDispatchMessage] = useState("");
+  const [dispatchSending, setDispatchSending] = useState(false);
+  const [uploadingKey, setUploadingKey] = useState("");
+
+  const isLivestock = collectionName === "livestockOrders";
+  const itemLabelSingular = isLivestock ? "livestock" : "egg";
+  const breakdownTitle = isLivestock ? "Livestock breakdown" : "Egg breakdown";
 
   useEffect(() => {
     setDraft({
       orderStatus: order.orderStatus ?? "pending",
+      deliveryOptionId: order.deliveryOptionId ?? "",
+      sendDate: order.sendDate ?? "",
       trackingLink: order.trackingLink ?? "",
+      notes: order.notes ?? "",
       internalNote: order.internalNote ?? ""
     });
+    const baseLines = Array.isArray(order.eggs)
+      ? order.eggs.map((item) => ({
+          lineId: createLineId(),
+          itemId: item.id ?? "",
+          label: item.label ?? "",
+          price: Number(item.price ?? 0),
+          specialPrice: item.specialPrice ?? null,
+          quantity: item.quantity ?? 0
+        }))
+      : [];
+    if (baseLines.length === 0) {
+      const fallback = itemOptions[0];
+      baseLines.push({
+        lineId: createLineId(),
+        itemId: fallback?.id ?? "",
+        label: fallback?.label ?? "",
+        price: Number(fallback?.price ?? 0),
+        specialPrice: fallback?.specialPrice ?? null,
+        quantity: 0
+      });
+    }
+    setLineItems(baseLines);
+    setCopyNotice("");
+    setDispatchMessage("");
+    setInternalNoteMessage("");
+    setTrackingMessage("");
   }, [order]);
+
+  const eggsTotal =
+    typeof order.eggsTotal === "number"
+      ? order.eggsTotal
+      : Array.isArray(order.eggs)
+        ? order.eggs.reduce((sum, item) => {
+            const price =
+              item.specialPrice === null || item.specialPrice === undefined || item.specialPrice === 0
+                ? item.price
+                : item.specialPrice;
+            return sum + Number(price ?? 0) * Number(item.quantity ?? 0);
+          }, 0)
+        : 0;
+
+  const deliveryCost =
+    typeof order.deliveryCost === "number"
+      ? order.deliveryCost
+      : deliveryOptions.find((option) => option.id === order.deliveryOptionId)?.cost ??
+        extractCost(order.deliveryOption);
+
+  const totalCost =
+    typeof order.totalCost === "number" ? order.totalCost : Number(eggsTotal) + Number(deliveryCost);
+
+  const orderFullName = [order.name, order.surname].filter(Boolean).join(" ").trim();
+  const contactLine = [order.email, order.cellphone].filter(Boolean).join(" · ");
+  const addressText = order.address?.trim() || "No address provided.";
+
+  const selectClass =
+    "w-full rounded-lg border border-brandGreen/30 bg-brandCream px-3 py-2 text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30";
+
+  const handleCopy = async (value, label) => {
+    if (!value) return;
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopyNotice(`${label} copied.`);
+    } catch (err) {
+      console.warn("copy failed", err);
+      setCopyNotice("Copy failed.");
+    }
+    setTimeout(() => setCopyNotice(""), 2000);
+  };
+
+  const handleStatusChange = async (value) => {
+    setDraft((prev) => ({ ...prev, orderStatus: value }));
+    try {
+      await onUpdate({ orderStatus: value });
+    } catch (err) {
+      console.error("order status update error", err);
+    }
+  };
+
+  const handleDeliveryChange = async (value) => {
+    setDraft((prev) => ({ ...prev, deliveryOptionId: value }));
+    const selected = deliveryOptions.find((option) => option.id === value);
+    if (!selected) return;
+    try {
+      await onUpdate({
+        deliveryOptionId: value,
+        deliveryOption: selected.label ?? "",
+        deliveryCost: Number(selected.cost ?? 0)
+      });
+    } catch (err) {
+      console.error("delivery update error", err);
+    }
+  };
+
+  const handleSendDateChange = async (value) => {
+    setDraft((prev) => ({ ...prev, sendDate: value }));
+    try {
+      await onUpdate({ sendDate: value });
+    } catch (err) {
+      console.error("send date update error", err);
+    }
+  };
+
+  const handleInternalNoteSave = async () => {
+    setInternalNoteSaving(true);
+    setInternalNoteMessage("");
+    try {
+      await onUpdate({ internalNote: draft.internalNote });
+      setInternalNoteMessage("Internal note saved.");
+    } catch (err) {
+      console.error("internal note update error", err);
+      setInternalNoteMessage("Unable to save internal note.");
+    } finally {
+      setInternalNoteSaving(false);
+    }
+  };
+
+  const handleTrackingSave = async () => {
+    setTrackingSaving(true);
+    setTrackingMessage("");
+    try {
+      await onUpdate({ trackingLink: draft.trackingLink.trim() });
+      setTrackingMessage("Tracking link saved.");
+    } catch (err) {
+      console.error("tracking link update error", err);
+      setTrackingMessage("Unable to save tracking link.");
+    } finally {
+      setTrackingSaving(false);
+    }
+  };
+
+  const handleLineChange = (lineId, updates) => {
+    setLineItems((prev) =>
+      prev.map((line) => (line.lineId === lineId ? { ...line, ...updates } : line))
+    );
+  };
+
+  const handleSelectItem = (lineId, value) => {
+    const selected = itemOptions.find((item) => item.id === value);
+    handleLineChange(lineId, {
+      itemId: value,
+      label: selected?.label ?? "",
+      price: Number(selected?.price ?? 0),
+      specialPrice: selected?.specialPrice ?? null
+    });
+  };
+
+  const handleAddLine = () => {
+    const fallback = itemOptions[0];
+    setLineItems((prev) => [
+      ...prev,
+      {
+        lineId: createLineId(),
+        itemId: fallback?.id ?? "",
+        label: fallback?.label ?? "",
+        price: Number(fallback?.price ?? 0),
+        specialPrice: fallback?.specialPrice ?? null,
+        quantity: 0
+      }
+    ]);
+  };
+
+  const handleRemoveLine = (lineId) => {
+    setLineItems((prev) => prev.filter((line) => line.lineId !== lineId));
+  };
+
+  const handleUpdateLines = async () => {
+    const nextEggs = lineItems
+      .filter((line) => Number(line.quantity ?? 0) > 0 && (line.itemId || line.label))
+      .map((line) => ({
+        id: line.itemId,
+        label: line.label,
+        quantity: Number(line.quantity ?? 0),
+        price: Number(line.price ?? 0),
+        specialPrice: line.specialPrice === "" ? null : line.specialPrice ?? null
+      }));
+    try {
+      await onUpdate({ eggs: nextEggs });
+    } catch (err) {
+      console.error("egg breakdown update error", err);
+    }
+  };
+
+  const handleAttachmentUpload = async (attachment, file) => {
+    if (!file) return;
+    setUploadingKey(attachment.key);
+    try {
+      const fileRef = storageRef(
+        storage,
+        `orders/${collectionName}/${order.id}/${attachment.key}_${Date.now()}_${file.name}`
+      );
+      await uploadBytes(fileRef, file);
+      const url = await getDownloadURL(fileRef);
+      await onUpdate({
+        [attachment.urlField]: url,
+        [attachment.nameField]: file.name
+      });
+    } catch (err) {
+      console.error("attachment upload error", err);
+    } finally {
+      setUploadingKey("");
+    }
+  };
+
+  const handleDispatchEmail = async () => {
+    setDispatchSending(true);
+    setDispatchMessage("");
+    try {
+      await onSendDispatchEmail(order);
+      setDispatchMessage("Dispatch email sent.");
+    } catch (err) {
+      setDispatchMessage("Unable to send dispatch email.");
+    } finally {
+      setDispatchSending(false);
+    }
+  };
+
+  const canSendDispatch = Boolean(order.email) && Boolean(draft.sendDate);
 
   return (
     <div
@@ -2526,67 +3116,51 @@ function OrderDetailModal({ order, collectionName, onClose, onUpdate, onDelete }
       onClick={onClose}
     >
       <div
-        className="w-full max-w-3xl rounded-2xl bg-white p-6 text-brandGreen shadow-2xl"
+        className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-2xl bg-white p-6 text-brandGreen shadow-2xl"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+        <div className="flex items-start justify-between gap-3">
           <div>
-            <h3 className="text-xl font-bold">Order details</h3>
-            <p className="text-sm text-brandGreen/70">
-              {collectionName === "livestockOrders" ? "Livestock order" : "Egg order"}
+            <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+              Order details
             </p>
+            <h3 className="text-2xl font-bold text-brandGreen">
+              {orderFullName || "Customer"}
+            </h3>
+            <p className="text-sm font-mono text-brandGreen">{order.orderNumber || "-"}</p>
+            <p className="text-brandGreen/70">{contactLine || "-"}</p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="rounded-full border border-brandGreen/30 px-3 py-1 text-xs font-semibold text-brandGreen"
-          >
-            Close
-          </button>
-        </div>
-
-        <div className="mt-4 grid gap-3 md:grid-cols-2">
-          <div className="rounded-xl border border-brandGreen/15 bg-brandBeige/40 p-4">
-            <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/60">
-              Customer
-            </p>
-            <p className="font-semibold text-brandGreen">
-              {order.name} {order.surname}
-            </p>
-            <p className="text-sm text-brandGreen/70">{order.email}</p>
-            <p className="text-sm text-brandGreen/70">{order.cellphone}</p>
-            <p className="text-sm text-brandGreen/70">{order.address}</p>
-          </div>
-          <div className="rounded-xl border border-brandGreen/15 bg-brandBeige/40 p-4">
-            <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/60">
-              Order
-            </p>
-            <p className="text-sm text-brandGreen">Order #: {order.orderNumber ?? "-"}</p>
-            <p className="text-sm text-brandGreen">Status: {order.orderStatus}</p>
-            <p className="text-sm text-brandGreen">Send date: {order.sendDate ?? "-"}</p>
-            <p className="text-sm text-brandGreen">Delivery: {order.deliveryOption}</p>
-            <p className="text-sm text-brandGreen">
-              Total: {order.totalCost ? `R${order.totalCost.toFixed(2)}` : "-"}
-            </p>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => onPaidToggle(order)}
+              className="rounded-full border border-emerald-300 px-3 py-2 text-xs font-semibold text-emerald-800 transition hover:bg-emerald-50"
+            >
+              {order.paid ? "Mark unpaid" : "Mark paid"}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-full bg-brandGreen px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:shadow-md"
+            >
+              Close
+            </button>
           </div>
         </div>
 
-        <div className="mt-4 rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
-          <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/60">
-            Items
-          </p>
-          <p className="text-sm text-brandGreen">{order.eggSummary || "-"}</p>
-        </div>
+        {copyNotice ? (
+          <p className="mt-2 text-xs font-semibold text-brandGreen/70">{copyNotice}</p>
+        ) : null}
 
-        <div className="mt-4 grid gap-3 md:grid-cols-3">
-          <div>
-            <label className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+        <div className="mt-4 grid gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
               Status
-            </label>
+            </p>
             <select
               value={draft.orderStatus}
-              onChange={(event) => setDraft((prev) => ({ ...prev, orderStatus: event.target.value }))}
-              className={inputClass}
+              onChange={(event) => handleStatusChange(event.target.value)}
+              className={selectClass}
             >
               {ORDER_STATUSES.map((status) => (
                 <option key={status.id} value={status.id}>
@@ -2594,45 +3168,340 @@ function OrderDetailModal({ order, collectionName, onClose, onUpdate, onDelete }
                 </option>
               ))}
             </select>
+            <div className="space-y-1">
+              <label className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+                Tracking link (optional)
+              </label>
+              <div className="flex flex-col gap-2 md:flex-row md:items-center">
+                <input
+                  type="url"
+                  value={draft.trackingLink}
+                  onChange={(event) =>
+                    setDraft((prev) => ({ ...prev, trackingLink: event.target.value }))
+                  }
+                  className="w-full rounded-lg border border-brandGreen/30 bg-white px-3 py-2 text-brandGreen placeholder:text-brandGreen/50 focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
+                  placeholder="https://..."
+                />
+                <button
+                  type="button"
+                  onClick={handleTrackingSave}
+                  disabled={trackingSaving}
+                  className="rounded-full bg-brandGreen px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:shadow-md disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {trackingSaving ? "Saving..." : "Save"}
+                </button>
+              </div>
+              {trackingMessage ? (
+                <p className="text-xs font-semibold text-brandGreen/70">
+                  {trackingMessage}
+                </p>
+              ) : null}
+            </div>
           </div>
-          <div>
-            <label className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
-              Tracking link
-            </label>
-            <input
-              type="text"
-              value={draft.trackingLink}
-              onChange={(event) =>
-                setDraft((prev) => ({ ...prev, trackingLink: event.target.value }))
-              }
-              className={inputClass}
-              placeholder="https://..."
-            />
-          </div>
-          <div>
-            <label className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
-              Internal note
-            </label>
-            <input
-              type="text"
-              value={draft.internalNote}
-              onChange={(event) =>
-                setDraft((prev) => ({ ...prev, internalNote: event.target.value }))
-              }
-              className={inputClass}
-              placeholder="Internal note"
-            />
+          <div className="space-y-2 text-right">
+            <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+              Totals
+            </p>
+            <div className="space-y-1 text-sm text-brandGreen">
+              <p>
+                Subtotal: <span className="font-semibold">{formatCurrency(eggsTotal)}</span>
+              </p>
+              <p>
+                Delivery:{" "}
+                <span className="font-semibold">{formatCurrency(deliveryCost)}</span>
+              </p>
+              <p className="text-lg font-bold text-brandGreen">
+                Total: {formatCurrency(totalCost)}
+              </p>
+            </div>
+            <p className="text-sm text-brandGreen">Paid: {order.paid ? "Yes" : "No"}</p>
+            <p className="text-sm text-brandGreen">
+              Delivery: {order.deliveryOption ?? "-"}
+            </p>
+            <p className="text-sm text-brandGreen">Send date: {order.sendDate ?? "-"}</p>
           </div>
         </div>
 
-        <div className="mt-4 flex flex-wrap justify-end gap-2">
-          <button
-            type="button"
-            onClick={() => onUpdate(draft)}
-            className="rounded-full bg-brandGreen px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:shadow-md"
-          >
-            Save updates
-          </button>
+        <div className="mt-4 grid gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+              Delivery address
+            </p>
+            <div className="flex items-center gap-2">
+              <p className="text-brandGreen whitespace-pre-line">{addressText}</p>
+              <button
+                type="button"
+                aria-label="Copy address"
+                onClick={() => handleCopy(addressText, "Address")}
+                className="rounded-full border border-brandGreen/30 px-2 py-1 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+              >
+                Copy
+              </button>
+            </div>
+          </div>
+          <div className="space-y-2">
+            <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+              Contact
+            </p>
+            <div className="space-y-1 text-brandGreen">
+              <div className="flex items-center gap-2">
+                <span className="font-semibold">{orderFullName || "Customer"}</span>
+                <button
+                  type="button"
+                  aria-label="Copy name"
+                  onClick={() => handleCopy(orderFullName, "Name")}
+                  className="rounded-full border border-brandGreen/30 px-2 py-1 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+                >
+                  Copy
+                </button>
+              </div>
+              {order.email ? (
+                <div className="flex items-center gap-2">
+                  <a className="underline" href={`mailto:${order.email}`}>
+                    {order.email}
+                  </a>
+                  <button
+                    type="button"
+                    aria-label="Copy email"
+                    onClick={() => handleCopy(order.email, "Email")}
+                    className="rounded-full border border-brandGreen/30 px-2 py-1 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+                  >
+                    Copy
+                  </button>
+                </div>
+              ) : null}
+              {order.cellphone ? (
+                <div className="flex items-center gap-2">
+                  <a className="underline" href={`tel:${order.cellphone}`}>
+                    {order.cellphone}
+                  </a>
+                  <button
+                    type="button"
+                    aria-label="Copy phone"
+                    onClick={() => handleCopy(order.cellphone, "Phone")}
+                    className="rounded-full border border-brandGreen/30 px-2 py-1 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+                  >
+                    Copy
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4 space-y-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+            Bookkeeping attachments (optional)
+          </p>
+          <div className="grid gap-4 md:grid-cols-2">
+            {ORDER_ATTACHMENTS.map((attachment) => {
+              const attachmentUrl = order[attachment.urlField];
+              const attachmentName = order[attachment.nameField];
+              const isUploading = uploadingKey === attachment.key;
+              return (
+                <div
+                  key={attachment.key}
+                  className="rounded-2xl border border-brandGreen/10 bg-brandBeige/40 p-3"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="space-y-1">
+                      <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+                        {attachment.label}
+                      </p>
+                      {attachmentUrl ? (
+                        <a
+                          className="text-sm text-brandGreen underline decoration-brandGreen/40 underline-offset-4"
+                          href={attachmentUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {attachmentName || "View file"}
+                        </a>
+                      ) : (
+                        <p className="text-sm text-brandGreen/70">Not uploaded yet.</p>
+                      )}
+                    </div>
+                    <label
+                      className={`inline-flex items-center gap-2 rounded-full border border-brandGreen/30 px-3 py-1 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige ${
+                        isUploading ? "cursor-not-allowed opacity-60" : "cursor-pointer"
+                      }`}
+                    >
+                      <input
+                        className="sr-only"
+                        accept="application/pdf,image/*"
+                        type="file"
+                        disabled={isUploading}
+                        onChange={(event) =>
+                          handleAttachmentUpload(attachment, event.target.files?.[0])
+                        }
+                      />
+                      {isUploading ? "Uploading..." : "Upload file"}
+                    </label>
+                  </div>
+                  <p className="text-xs text-brandGreen/60">{attachment.description}</p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="mt-4 grid gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+              Delivery option
+            </p>
+            <select
+              className="w-full rounded-lg border border-brandGreen/30 bg-white px-3 py-2 text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
+              value={draft.deliveryOptionId}
+              onChange={(event) => handleDeliveryChange(event.target.value)}
+            >
+              <option value="">Select delivery</option>
+              {deliveryOptions.map((option) => (
+                <option key={option.id} value={option.id}>
+                  {option.label} ({formatCurrency(option.cost)})
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="space-y-2">
+            <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+              Send date
+            </p>
+            <div className="space-y-2">
+              <input
+                className="w-full rounded-lg border border-brandGreen/30 bg-white px-3 py-2 text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
+                type="date"
+                value={draft.sendDate}
+                onChange={(event) => handleSendDateChange(event.target.value)}
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleDispatchEmail}
+                  disabled={!canSendDispatch || dispatchSending}
+                  className="rounded-full bg-brandGreen px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {dispatchSending ? "Sending..." : "Send dispatch email"}
+                </button>
+                {dispatchMessage ? (
+                  <span className="text-xs font-semibold text-brandGreen/70">
+                    {dispatchMessage}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-4">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+            Notes / comments
+          </p>
+          <textarea
+            className="w-full rounded-lg border border-brandGreen/30 bg-white px-3 py-2 text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
+            value={draft.notes}
+            readOnly
+            rows={3}
+          />
+        </div>
+
+        <div className="mt-4 space-y-2">
+          <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+            Internal note (not emailed to customer)
+          </p>
+          <textarea
+            placeholder="Add private admin notes. This saves to the order but does not send an email."
+            className="w-full rounded-lg border border-brandGreen/30 bg-brandBeige/40 px-3 py-2 text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
+            value={draft.internalNote}
+            onChange={(event) =>
+              setDraft((prev) => ({ ...prev, internalNote: event.target.value }))
+            }
+          />
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="text-xs font-semibold text-brandGreen/70">
+              {internalNoteMessage}
+            </span>
+            <button
+              type="button"
+              onClick={handleInternalNoteSave}
+              disabled={internalNoteSaving}
+              className="rounded-full bg-brandGreen px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:shadow-md disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {internalNoteSaving ? "Saving..." : "Save internal note"}
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4">
+          <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+            {breakdownTitle}
+          </p>
+          <div className="space-y-2">
+            {lineItems.map((line) => {
+              const optionExists = itemOptions.some((item) => item.id === line.itemId);
+              return (
+                <div
+                  key={line.lineId}
+                  className="flex flex-col gap-2 rounded-lg border border-brandGreen/15 bg-brandBeige/40 p-3 md:flex-row md:items-center"
+                >
+                  <select
+                    className="w-full rounded-lg border border-brandGreen/30 bg-white px-3 py-2 text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
+                    value={line.itemId}
+                    onChange={(event) => handleSelectItem(line.lineId, event.target.value)}
+                  >
+                    <option value="">{`Select ${itemLabelSingular}`}</option>
+                    {itemOptions.map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                    {!optionExists && line.itemId ? (
+                      <option value={line.itemId}>{line.label || "Unknown"}</option>
+                    ) : null}
+                  </select>
+                  <input
+                    placeholder="Qty"
+                    className="w-full rounded-lg border border-brandGreen/30 bg-white px-3 py-2 text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30 md:w-32"
+                    type="number"
+                    value={line.quantity}
+                    onChange={(event) =>
+                      handleLineChange(line.lineId, {
+                        quantity: event.target.value === "" ? "" : Number(event.target.value)
+                      })
+                    }
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveLine(line.lineId)}
+                    className="rounded-full border border-red-300 px-3 py-1 text-xs font-semibold text-red-700 transition hover:bg-red-50"
+                  >
+                    Remove
+                  </button>
+                </div>
+              );
+            })}
+            <div className="flex justify-between">
+              <button
+                type="button"
+                onClick={handleAddLine}
+                className="rounded-full border border-brandGreen/30 px-3 py-1 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+              >
+                {`Add ${itemLabelSingular} line`}
+              </button>
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={handleUpdateLines}
+                  className="rounded-full bg-brandGreen px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:shadow-md"
+                >
+                  Update
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-6 flex flex-wrap justify-between gap-2">
           <button
             type="button"
             onClick={onDelete}
@@ -2640,6 +3509,22 @@ function OrderDetailModal({ order, collectionName, onClose, onUpdate, onDelete }
           >
             Delete order
           </button>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => onPaidToggle(order)}
+              className="rounded-full border border-emerald-300 px-4 py-2 text-sm font-semibold text-emerald-800 transition hover:bg-emerald-50"
+            >
+              {order.paid ? "Mark unpaid" : "Mark paid"}
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-full bg-brandGreen px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:shadow-md"
+            >
+              Close
+            </button>
+          </div>
         </div>
       </div>
     </div>

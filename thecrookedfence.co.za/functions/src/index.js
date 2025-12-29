@@ -26,6 +26,13 @@ const requireAdmin = (context) => {
   }
 };
 
+const requireStaff = (context) => {
+  const role = getRoleFromContext(context);
+  if (role !== "admin" && role !== "super_admin" && role !== "worker") {
+    throw new functions.https.HttpsError("permission-denied", "Staff access required.");
+  }
+};
+
 const getResendClient = () => {
   const apiKey = process.env.RESEND_API_KEY || functions.config()?.resend?.api_key;
   return apiKey ? new Resend(apiKey) : null;
@@ -156,6 +163,85 @@ exports.deleteCategoryWithItems = functions.https.onCall(async (data, context) =
   await batch.commit();
 
   return { deletedItems: itemsQuery.size };
+});
+
+exports.sendDispatchEmail = functions.https.onCall(async (data, context) => {
+  requireStaff(context);
+  const resend = getResendClient();
+
+  if (!resend) {
+    throw new functions.https.HttpsError(
+      "failed-precondition",
+      "Resend API key is not configured."
+    );
+  }
+
+  const collectionName = String(data?.collectionName || "").trim();
+  if (!["eggOrders", "livestockOrders"].includes(collectionName)) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid collection name.");
+  }
+
+  const orderId = String(data?.orderId || "").trim();
+  if (!orderId) {
+    throw new functions.https.HttpsError("invalid-argument", "Order id is required.");
+  }
+
+  const orderRef = db.collection(collectionName).doc(orderId);
+  const orderSnap = await orderRef.get();
+  if (!orderSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Order not found.");
+  }
+
+  const order = orderSnap.data() || {};
+  const email = String(order.email || "").trim();
+  if (!email) {
+    throw new functions.https.HttpsError("failed-precondition", "Order email is missing.");
+  }
+
+  const name = [order.name, order.surname].filter(Boolean).join(" ").trim() || "Customer";
+  const orderNumberLabel = order.orderNumber ? ` ${order.orderNumber}` : "";
+  const sendDate = order.sendDate || "";
+  const delivery = order.deliveryOption || "";
+  const trackingLink = order.trackingLink || "";
+  const items = Array.isArray(order.eggs) ? order.eggs : [];
+  const itemSummary = items
+    .filter((item) => Number(item.quantity ?? 0) > 0)
+    .map((item) => `${item.label} x ${item.quantity}`)
+    .join(", ");
+
+  const sendDateLine = sendDate ? `<p><strong>Send date:</strong> ${sendDate}</p>` : "";
+  const deliveryLine = delivery ? `<p><strong>Delivery:</strong> ${delivery}</p>` : "";
+  const itemLine = itemSummary ? `<p><strong>Items:</strong> ${itemSummary}</p>` : "";
+  const trackingLine = trackingLink
+    ? `<p><strong>Tracking:</strong> <a href="${trackingLink}">${trackingLink}</a></p>`
+    : "";
+
+  const subject = `Your order${orderNumberLabel} update from The Crooked Fence`;
+  const html = `
+    <p>Hi ${name},</p>
+    <p>Your order${orderNumberLabel} is being prepared for dispatch.</p>
+    ${sendDateLine}
+    ${deliveryLine}
+    ${itemLine}
+    ${trackingLine}
+    <p>If you have questions, reply to this email.</p>
+    <p>Thank you,</p>
+    <p>The Crooked Fence</p>
+  `;
+
+  const result = await resend.emails.send({
+    from: "The Crooked Fence <no-reply@thecrookedfence.co.za>",
+    to: [email],
+    subject,
+    html
+  });
+
+  await orderRef.set(
+    { dispatchEmailSentAt: admin.firestore.FieldValue.serverTimestamp() },
+    { merge: true }
+  );
+
+  return { id: result?.data?.id || null };
 });
 
 exports.sendTestEmail = functions.https.onCall(async (data, context) => {
