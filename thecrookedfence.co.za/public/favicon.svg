@@ -1,4 +1,15 @@
 <svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
   <rect width="128" height="128" rx="24" fill="#3a5a3c" />
-  <path d="M28 44h72v12H70v40H58V56H28V44z" fill="#f7f4eb" />
+  <text
+    x="64"
+    y="64"
+    text-anchor="middle"
+    dominant-baseline="middle"
+    font-size="44"
+    font-weight="700"
+    font-family="Nunito Sans, Arial, sans-serif"
+    fill="#f7f4eb"
+  >
+    TCF
+  </text>
 </svg>

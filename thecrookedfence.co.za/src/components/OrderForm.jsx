@@ -384,8 +384,8 @@ export default function OrderForm({ variant = "eggs" }) {
           </div>
           <div className="w-full space-y-2 rounded-xl bg-white/70 p-4 text-left text-sm text-brandGreen shadow-inner">
             <p className="font-semibold text-red-700">
-              This form is not monitored. If you place an order here, please WhatsApp 082 891
-              07612 to confirm payment.
+              Please follow up via WhatsApp (082 891 07612) for order updates and to confirm
+              payment by sending proof of payment.
             </p>
             <p className="text-brandGreen/80">
               Support email:{" "}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getIdTokenResult,
   onAuthStateChanged,
@@ -37,6 +37,7 @@ const panelClass = "rounded-2xl border border-brandGreen/10 bg-white/70 p-4 shad
 const inputClass =
   "w-full rounded-lg border border-brandGreen/30 bg-white px-3 py-2 text-brandGreen placeholder:text-brandGreen/50 focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30";
 const mutedText = "text-brandGreen/70";
+const STOCK_LOG_LIMIT = 25;
 
 const formatTimestamp = (value) => {
   if (!value) return "-";
@@ -57,6 +58,24 @@ const formatCurrency = (value) => {
   return `R${Number(value).toFixed(2)}`;
 };
 
+const formatDuration = (totalSeconds) => {
+  const safeSeconds = Number.isFinite(totalSeconds) ? Math.max(0, totalSeconds) : 0;
+  const minutes = Math.floor(safeSeconds / 60);
+  const seconds = Math.floor(safeSeconds % 60);
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+};
+
+const getVoiceNoteMimeType = () => {
+  if (typeof MediaRecorder === "undefined") return "";
+  const options = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/mp4"
+  ];
+  return options.find((type) => MediaRecorder.isTypeSupported(type)) ?? "";
+};
+
 const extractCost = (label) => {
   if (!label) return 0;
   const match = label.match(/R\s*([\d.]+)/i);
@@ -64,6 +83,171 @@ const extractCost = (label) => {
 };
 
 const ORDER_ATTACHMENTS = FINANCE_ATTACHMENTS;
+
+const toNumber = (value) => {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed)) return parsed;
+  if (typeof value === "string") {
+    const floatParsed = Number.parseFloat(value);
+    if (Number.isFinite(floatParsed)) return floatParsed;
+  }
+  return 0;
+};
+
+const resolveStockUpdateQuantity = (draft, currentQuantity) => {
+  if (!draft || draft.quantity === "" || draft.quantity === undefined) return currentQuantity;
+  const parsed = Number(draft.quantity);
+  return Number.isFinite(parsed) ? parsed : currentQuantity;
+};
+
+const normalizeLogEntry = (entry = {}) => {
+  if (Array.isArray(entry)) {
+    const [name, fromQty, toQty, change] = entry;
+    return normalizeLogEntry({ name, fromQty, toQty, change });
+  }
+
+  const name =
+    entry.name ??
+    entry.label ??
+    entry.summary ??
+    entry.itemName ??
+    entry.item ??
+    entry.itemLabel ??
+    entry.item_name ??
+    entry.product ??
+    entry.stockItem ??
+    entry.stockName ??
+    entry.title ??
+    "Item";
+
+  const qtySource = entry.qty ?? entry.quantity ?? entry.quantities ?? {};
+  const rawFrom =
+    entry.fromQty ??
+    entry.from ??
+    entry.prevQty ??
+    entry.previousQty ??
+    entry.previous ??
+    entry.before ??
+    entry.beforeQty ??
+    entry.beforeQuantity ??
+    entry.oldQty ??
+    entry.oldQuantity ??
+    entry.old ??
+    entry.startQty ??
+    entry.startQuantity ??
+    entry.start ??
+    entry.qtyBefore ??
+    entry.quantityBefore ??
+    qtySource.from ??
+    qtySource.before ??
+    qtySource.start ??
+    qtySource.previous;
+  const rawTo =
+    entry.toQty ??
+    entry.to ??
+    entry.nextQty ??
+    entry.next ??
+    entry.afterQty ??
+    entry.after ??
+    entry.afterQuantity ??
+    entry.newQty ??
+    entry.newQuantity ??
+    entry.new ??
+    entry.endQty ??
+    entry.endQuantity ??
+    entry.end ??
+    entry.qtyAfter ??
+    entry.quantityAfter ??
+    qtySource.to ??
+    qtySource.after ??
+    qtySource.end ??
+    qtySource.next;
+
+  const parseQtyRange = (text) => {
+    if (typeof text !== "string") return null;
+    const match = text.match(/(-?\d+\.?\d*)\s*(?:→|->|to)\s*(-?\d+\.?\d*)/i);
+    if (!match) return null;
+    return { from: toNumber(match[1]), to: toNumber(match[2]) };
+  };
+
+  const qtyText =
+    typeof qtySource === "string"
+      ? qtySource
+      : entry.qtyText ?? entry.quantityText ?? entry.qtyRange ?? entry.range ?? "";
+  const rangeFromText =
+    parseQtyRange(rawFrom) || parseQtyRange(rawTo) || parseQtyRange(qtyText);
+
+  let fromQty = rangeFromText ? rangeFromText.from : toNumber(rawFrom);
+  let toQty = rangeFromText ? rangeFromText.to : toNumber(rawTo);
+  let hasQtyRange = Boolean(rangeFromText) || rawFrom !== undefined || rawTo !== undefined;
+
+  const rawChange =
+    entry.change ??
+    entry.delta ??
+    entry.diff ??
+    entry.changeQty ??
+    entry.qtyChange ??
+    entry.changeAmount ??
+    entry.changeValue ??
+    entry.deltaQty ??
+    entry.difference ??
+    entry.amount ??
+    entry.value ??
+    entry.adjustment;
+  let change = toNumber(rawChange);
+  if (hasQtyRange) {
+    change = toQty - fromQty;
+  } else if (rawChange === undefined && (rawFrom !== undefined || rawTo !== undefined)) {
+    change = toQty - fromQty;
+  }
+
+  return {
+    name,
+    change,
+    fromQty,
+    toQty,
+    notes: entry.notes ?? entry.note ?? ""
+  };
+};
+
+const normalizeEntryList = (entries) => {
+  if (Array.isArray(entries)) return entries.map((entry) => normalizeLogEntry(entry));
+  if (entries && typeof entries === "object") {
+    return Object.values(entries).map((entry) => normalizeLogEntry(entry));
+  }
+  return [];
+};
+
+const getLogEntries = (log) => {
+  const sources = [log.items, log.entries, log.changes, log.updates];
+  for (const source of sources) {
+    const list = normalizeEntryList(source);
+    if (list.length > 0) return list;
+  }
+  return [
+    normalizeLogEntry({
+      name: log.summary || log.name || "Stock update",
+      change: log.change,
+      fromQty: log.fromQty,
+      toQty: log.toQty,
+      notes: log.notes
+    })
+  ];
+};
+
+const getLogTitle = (log, entries) => {
+  if (log.summary || log.name) return log.summary || log.name;
+  if (entries.length > 1) return `Batch update (${entries.length} items)`;
+  return entries[0]?.name || "Stock update";
+};
+
+const formatChangeValue = (value) => (value > 0 ? `+${value}` : `${value}`);
+
+const getChangeColor = (value) => {
+  if (value > 0) return "text-emerald-700";
+  if (value < 0) return "text-red-700";
+  return "text-brandGreen";
+};
 
 const createLineId = () =>
   `line_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -206,13 +390,16 @@ export default function AdminPage() {
 function AdminDashboard({ user, role }) {
   const isAdmin = role === "admin" || role === "super_admin";
   const isWorker = role === "worker";
+  const initialActiveTab = isWorker ? "stock_updates" : "orders";
 
-  const [activeTab, setActiveTab] = useState(isWorker ? "stock_updates" : "orders");
+  const [activeTab, setActiveTab] = useState(initialActiveTab);
   const [openMenu, setOpenMenu] = useState(null);
 
   useEffect(() => {
-    if (isWorker) setActiveTab("stock_updates");
-  }, [isWorker]);
+    if (isWorker && activeTab !== "stock_updates") {
+      setActiveTab("stock_updates");
+    }
+  }, [isWorker, activeTab]);
 
   useEffect(() => {
     if (!openMenu) return undefined;
@@ -293,6 +480,20 @@ function AdminDashboard({ user, role }) {
   const [stockSearch, setStockSearch] = useState("");
   const [stockSort, setStockSort] = useState("name_asc");
   const [stockCategoryFilter, setStockCategoryFilter] = useState("all");
+  const [stockUpdateCategoryFilter, setStockUpdateCategoryFilter] = useState("all");
+  const [stockUpdateDrafts, setStockUpdateDrafts] = useState({});
+  const [stockUpdateSubmitting, setStockUpdateSubmitting] = useState(false);
+  const [voiceNote, setVoiceNote] = useState(null);
+  const [voiceNoteError, setVoiceNoteError] = useState("");
+  const [isRecordingVoiceNote, setIsRecordingVoiceNote] = useState(false);
+  const [voiceNoteDuration, setVoiceNoteDuration] = useState(0);
+  const mediaRecorderRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const recordingChunksRef = useRef([]);
+  const recordingTimerRef = useRef(null);
+  const recordingStartRef = useRef(null);
+  const [stockLogSearch, setStockLogSearch] = useState("");
+  const [showAllStockLogs, setShowAllStockLogs] = useState(false);
 
   const [userDraft, setUserDraft] = useState({ email: "", role: "worker", password: "" });
   const [userMessage, setUserMessage] = useState("");
@@ -305,8 +506,40 @@ function AdminDashboard({ user, role }) {
     date: new Date().toISOString().split("T")[0],
     file: null
   });
+  const [financeTimeScope, setFinanceTimeScope] = useState("month");
+  const [financeMonth, setFinanceMonth] = useState(
+    new Date().toISOString().slice(0, 7)
+  );
+  const [financeSort, setFinanceSort] = useState("dateDesc");
+  const [financeMinAmount, setFinanceMinAmount] = useState("");
+  const [financeMaxAmount, setFinanceMaxAmount] = useState("");
+  const [financeHasReceipt, setFinanceHasReceipt] = useState(false);
+  const [financeShowFilters, setFinanceShowFilters] = useState(true);
+  const [showFinanceForm, setShowFinanceForm] = useState(false);
   const [financeMessage, setFinanceMessage] = useState("");
   const [financeError, setFinanceError] = useState("");
+
+  useEffect(() => {
+    return () => {
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+      }
+      if (mediaRecorderRef.current?.state === "recording") {
+        mediaRecorderRef.current.stop();
+      }
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (voiceNote?.previewUrl) {
+        URL.revokeObjectURL(voiceNote.previewUrl);
+      }
+    };
+  }, [voiceNote?.previewUrl]);
 
   useEffect(() => {
     const unsubEggOrders = onSnapshot(
@@ -575,6 +808,14 @@ function AdminDashboard({ user, role }) {
     if (updated && updated !== selectedOrder) setSelectedOrder(updated);
   }, [selectedOrder, selectedOrderCollection, enrichedEggOrders, enrichedLivestockOrders]);
 
+  const stockCategoryLookup = useMemo(() => {
+    const lookup = new Map();
+    stockCategories.forEach((category) => {
+      lookup.set(category.id, category.name ?? "Unnamed");
+    });
+    return lookup;
+  }, [stockCategories]);
+
   const stockCategoryOptions = useMemo(() => {
     const options = stockCategories.map((category) => ({
       id: category.id,
@@ -618,6 +859,127 @@ function AdminDashboard({ user, role }) {
     });
   }, [stockItems, stockSearch, stockCategoryFilter, stockSort]);
 
+  const stockUpdateCategoryOptions = useMemo(() => {
+    const categoryMap = new Map();
+    stockItems.forEach((item) => {
+      const categoryName = item.category?.trim();
+      const key =
+        item.categoryId || (categoryName ? `name:${categoryName}` : UNCATEGORIZED_ID);
+      const label =
+        stockCategoryLookup.get(item.categoryId) ?? categoryName ?? UNCATEGORIZED_LABEL;
+      categoryMap.set(key, label);
+    });
+    const sorted = Array.from(categoryMap.entries())
+      .map(([id, label]) => ({ id, label }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+    return [{ id: "all", label: "All categories" }, ...sorted];
+  }, [stockItems, stockCategoryLookup]);
+
+  useEffect(() => {
+    if (stockUpdateCategoryFilter === "all") return;
+    const stillValid = stockUpdateCategoryOptions.some(
+      (option) => option.id === stockUpdateCategoryFilter
+    );
+    if (!stillValid) setStockUpdateCategoryFilter("all");
+  }, [stockUpdateCategoryFilter, stockUpdateCategoryOptions]);
+
+  const stockUpdateGroups = useMemo(() => {
+    const categoryMap = new Map();
+    const getCategoryKey = (item) => {
+      const categoryName = item.category?.trim();
+      return item.categoryId || (categoryName ? `name:${categoryName}` : UNCATEGORIZED_ID);
+    };
+    const getCategoryLabel = (item) => {
+      const categoryName = item.category?.trim();
+      return stockCategoryLookup.get(item.categoryId) ?? categoryName ?? UNCATEGORIZED_LABEL;
+    };
+
+    stockItems.forEach((item) => {
+      const categoryKey = getCategoryKey(item);
+      if (stockUpdateCategoryFilter !== "all" && categoryKey !== stockUpdateCategoryFilter) {
+        return;
+      }
+      const categoryLabel = getCategoryLabel(item);
+      const subLabel = item.subCategory?.trim() || "Items";
+      const categoryGroup =
+        categoryMap.get(categoryKey) ?? { key: categoryKey, label: categoryLabel, subGroups: new Map() };
+      const subKey = subLabel.toLowerCase();
+      const subGroup =
+        categoryGroup.subGroups.get(subKey) ?? { key: subKey, label: subLabel, items: [] };
+
+      subGroup.items.push(item);
+      categoryGroup.subGroups.set(subKey, subGroup);
+      categoryMap.set(categoryKey, categoryGroup);
+    });
+
+    return Array.from(categoryMap.values())
+      .map((category) => {
+        const subGroups = Array.from(category.subGroups.values())
+          .map((group) => ({
+            ...group,
+            items: group.items
+              .slice()
+              .sort((a, b) => String(a.name ?? "").localeCompare(String(b.name ?? "")))
+          }))
+          .sort((a, b) => a.label.localeCompare(b.label));
+        return { ...category, subGroups };
+      })
+      .sort((a, b) => a.label.localeCompare(b.label));
+  }, [stockItems, stockUpdateCategoryFilter, stockCategoryLookup]);
+
+  const hasPendingStockUpdates = useMemo(() => {
+    return stockItems.some((item) => {
+      const draft = stockUpdateDrafts[item.id];
+      if (!draft) return false;
+      const currentQuantity = Number(item.quantity ?? 0);
+      const nextQuantity = resolveStockUpdateQuantity(draft, currentQuantity);
+      const currentNotes = item.notes ?? "";
+      const nextNotes = draft.notes ?? currentNotes;
+      return nextQuantity !== currentQuantity || nextNotes !== currentNotes;
+    });
+  }, [stockItems, stockUpdateDrafts]);
+
+  const visibleStockLogs = useMemo(
+    () => (showAllStockLogs ? stockLogs : stockLogs.slice(0, STOCK_LOG_LIMIT)),
+    [stockLogs, showAllStockLogs]
+  );
+
+  const filteredStockLogs = useMemo(() => {
+    const queryText = stockLogSearch.trim().toLowerCase();
+    if (!queryText) return visibleStockLogs;
+    return visibleStockLogs.filter((log) => {
+      const entries = getLogEntries(log);
+      const entryText = entries
+        .map((entry) =>
+          [
+            entry.name,
+            entry.notes,
+            formatChangeValue(entry.change),
+            entry.fromQty,
+            entry.toQty
+          ]
+            .filter(Boolean)
+            .join(" ")
+        )
+        .join(" ");
+      return [
+        log.summary,
+        log.name,
+        log.notes,
+        log.userEmail,
+        log.updatedBy,
+        formatChangeValue(toNumber(log.change)),
+        log.fromQty,
+        log.toQty,
+        entryText
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase()
+        .includes(queryText);
+    });
+  }, [visibleStockLogs, stockLogSearch]);
+
   const ordersSummary = useMemo(() => {
     const allOrders = [...enrichedEggOrders, ...enrichedLivestockOrders];
     const totalValue = allOrders.reduce((sum, order) => sum + (order.totalCost ?? 0), 0);
@@ -627,6 +989,26 @@ function AdminDashboard({ user, role }) {
       paidCount: allOrders.filter((order) => order.paid).length
     };
   }, [enrichedEggOrders, enrichedLivestockOrders]);
+
+  const readyDispatchEggCount = useMemo(() => {
+    const readyStatuses = new Set(["packed", "scheduled_dispatch"]);
+    return enrichedEggOrders.reduce((sum, order) => {
+      if (!readyStatuses.has(order.orderStatus)) return sum;
+      const eggs = Array.isArray(order.eggs) ? order.eggs : [];
+      const orderCount = eggs.reduce(
+        (eggSum, item) => eggSum + toNumber(item.quantity),
+        0
+      );
+      return sum + orderCount;
+    }, 0);
+  }, [enrichedEggOrders]);
+
+  const resolveFinanceEntryDate = (entry) => {
+    if (entry.date) return new Date(`${entry.date}T00:00:00`);
+    if (entry.createdAt?.toDate) return entry.createdAt.toDate();
+    if (entry.createdAt?.seconds) return new Date(entry.createdAt.seconds * 1000);
+    return null;
+  };
 
   const financeSummary = useMemo(() => {
     return financeEntries.reduce(
@@ -638,6 +1020,261 @@ function AdminDashboard({ user, role }) {
       },
       { income: 0, expense: 0 }
     );
+  }, [financeEntries]);
+  const financeSummaryBalance = financeSummary.income - financeSummary.expense;
+
+  const financeDateRange = useMemo(() => {
+    const now = new Date();
+    const parseMonthValue = (value) => {
+      if (!value) return null;
+      const [year, month] = value.split("-").map(Number);
+      if (!year || !month) return null;
+      return new Date(year, month - 1, 1);
+    };
+    const monthStart = parseMonthValue(financeMonth) || new Date(now.getFullYear(), now.getMonth(), 1);
+    let start;
+    let end;
+    switch (financeTimeScope) {
+      case "day": {
+        start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        end = new Date(start);
+        end.setDate(start.getDate() + 1);
+        break;
+      }
+      case "week": {
+        end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+        start = new Date(end);
+        start.setDate(end.getDate() - 7);
+        break;
+      }
+      case "year": {
+        start = new Date(monthStart.getFullYear(), 0, 1);
+        end = new Date(monthStart.getFullYear() + 1, 0, 1);
+        break;
+      }
+      case "month":
+      default: {
+        start = monthStart;
+        end = new Date(monthStart.getFullYear(), monthStart.getMonth() + 1, 1);
+        break;
+      }
+    }
+    return { start, end };
+  }, [financeMonth, financeTimeScope]);
+
+  const filteredFinanceEntries = useMemo(() => {
+    const minAmount = financeMinAmount === "" ? null : Number(financeMinAmount);
+    const maxAmount = financeMaxAmount === "" ? null : Number(financeMaxAmount);
+    const { start, end } = financeDateRange;
+
+    const filtered = financeEntries.filter((entry) => {
+      const amount = Number(entry.amount ?? 0);
+      if (minAmount !== null && Number.isFinite(minAmount) && amount < minAmount) {
+        return false;
+      }
+      if (maxAmount !== null && Number.isFinite(maxAmount) && amount > maxAmount) {
+        return false;
+      }
+      if (financeHasReceipt && !entry.attachmentUrl) return false;
+      const entryDate = resolveFinanceEntryDate(entry);
+      if (!entryDate) return false;
+      if (entryDate < start || entryDate >= end) return false;
+      return true;
+    });
+
+    return filtered.sort((a, b) => {
+      const amountA = Number(a.amount ?? 0);
+      const amountB = Number(b.amount ?? 0);
+      const dateA = resolveFinanceEntryDate(a)?.getTime() ?? 0;
+      const dateB = resolveFinanceEntryDate(b)?.getTime() ?? 0;
+      switch (financeSort) {
+        case "amountAsc":
+          return amountA - amountB;
+        case "amountDesc":
+          return amountB - amountA;
+        case "dateAsc":
+          return dateA - dateB;
+        case "dateDesc":
+        default:
+          return dateB - dateA;
+      }
+    });
+  }, [
+    financeEntries,
+    financeDateRange,
+    financeMinAmount,
+    financeMaxAmount,
+    financeHasReceipt,
+    financeSort
+  ]);
+
+  const financeTotals = useMemo(() => {
+    return filteredFinanceEntries.reduce(
+      (totals, entry) => {
+        const amount = Number(entry.amount ?? 0);
+        if (entry.type === "income") totals.income += amount;
+        else totals.expense += amount;
+        return totals;
+      },
+      { income: 0, expense: 0 }
+    );
+  }, [filteredFinanceEntries]);
+
+  const financeIncomeEntries = useMemo(
+    () => filteredFinanceEntries.filter((entry) => entry.type === "income"),
+    [filteredFinanceEntries]
+  );
+  const financeExpenseEntries = useMemo(
+    () => filteredFinanceEntries.filter((entry) => entry.type === "expense"),
+    [filteredFinanceEntries]
+  );
+  const financeBalance = financeTotals.income - financeTotals.expense;
+
+  const reportOrders = useMemo(
+    () => [...enrichedEggOrders, ...enrichedLivestockOrders],
+    [enrichedEggOrders, enrichedLivestockOrders]
+  );
+
+  const orderStatusDistribution = useMemo(() => {
+    const counts = ORDER_STATUSES.reduce((acc, status) => {
+      acc[status.id] = 0;
+      return acc;
+    }, {});
+    reportOrders.forEach((order) => {
+      const status = order.orderStatus ?? "pending";
+      if (counts[status] === undefined) {
+        counts[status] = 0;
+      }
+      counts[status] += 1;
+    });
+    const maxCount = Math.max(0, ...Object.values(counts));
+    return ORDER_STATUSES.map((status) => {
+      const count = counts[status.id] ?? 0;
+      const percent = maxCount === 0 ? 0 : Math.round((count / maxCount) * 100);
+      return { ...status, count, percent };
+    });
+  }, [reportOrders]);
+
+  const orderStatusAverageDays = useMemo(() => {
+    const totals = ORDER_STATUSES.reduce((acc, status) => {
+      acc[status.id] = { count: 0, sumDays: 0 };
+      return acc;
+    }, {});
+    const now = Date.now();
+    reportOrders.forEach((order) => {
+      const status = order.orderStatus ?? "pending";
+      const createdAt = order.createdAtDate;
+      if (!createdAt) return;
+      if (!totals[status]) totals[status] = { count: 0, sumDays: 0 };
+      const days = (now - createdAt.getTime()) / (1000 * 60 * 60 * 24);
+      totals[status].count += 1;
+      totals[status].sumDays += days;
+    });
+    return ORDER_STATUSES.map((status) => {
+      const entry = totals[status.id] ?? { count: 0, sumDays: 0 };
+      const avg = entry.count ? entry.sumDays / entry.count : 0;
+      return { ...status, avgDays: avg };
+    });
+  }, [reportOrders]);
+
+  const stockSummary = useMemo(() => {
+    const totalItems = stockItems.length;
+    const lowStock = stockItems.filter((item) => {
+      const quantity = Number(item.quantity ?? 0);
+      const threshold = Number(item.threshold ?? 0);
+      if (!Number.isFinite(threshold) || threshold <= 0) return false;
+      return quantity <= threshold;
+    }).length;
+    const totalQuantity = stockItems.reduce(
+      (sum, item) => sum + Number(item.quantity ?? 0),
+      0
+    );
+    return { totalItems, lowStock, totalQuantity };
+  }, [stockItems]);
+
+  const stockCategoryBreakdown = useMemo(() => {
+    const totals = new Map();
+    stockItems.forEach((item) => {
+      const label =
+        stockCategoryLookup.get(item.categoryId) ??
+        item.category?.trim() ??
+        UNCATEGORIZED_LABEL;
+      const quantity = Number(item.quantity ?? 0);
+      totals.set(label, (totals.get(label) ?? 0) + quantity);
+    });
+    const entries = Array.from(totals.entries())
+      .map(([label, quantity]) => ({ label, quantity }))
+      .sort((a, b) => b.quantity - a.quantity);
+    const maxRows = 5;
+    const visible = entries.slice(0, maxRows);
+    const remaining = entries.slice(maxRows);
+    if (remaining.length > 0) {
+      const otherTotal = remaining.reduce((sum, entry) => sum + entry.quantity, 0);
+      visible.push({ label: "Other", quantity: otherTotal });
+    }
+    return visible;
+  }, [stockItems, stockCategoryLookup]);
+
+  const financeTrend = useMemo(() => {
+    const totals = new Map();
+    financeEntries.forEach((entry) => {
+      const date = resolveFinanceEntryDate(entry);
+      if (!date) return;
+      const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+      const label = date.toLocaleString("en-US", { month: "short", year: "numeric" });
+      const current = totals.get(key) ?? { key, label, income: 0, expense: 0, date };
+      const amount = Number(entry.amount ?? 0);
+      if (entry.type === "income") current.income += amount;
+      else current.expense += amount;
+      totals.set(key, current);
+    });
+    let entries = Array.from(totals.values()).sort(
+      (a, b) => a.date.getTime() - b.date.getTime()
+    );
+    if (entries.length === 0) {
+      const now = new Date();
+      entries = [
+        {
+          key: `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`,
+          label: now.toLocaleString("en-US", { month: "short", year: "numeric" }),
+          income: 0,
+          expense: 0,
+          date: now
+        }
+      ];
+    }
+    const recent = entries.slice(-6);
+    const maxAmount = Math.max(
+      0,
+      ...recent.map((entry) => Math.max(entry.income, entry.expense))
+    );
+    return recent.map((entry) => ({
+      ...entry,
+      incomePercent: maxAmount === 0 ? 0 : Math.round((entry.income / maxAmount) * 100),
+      expensePercent: maxAmount === 0 ? 0 : Math.round((entry.expense / maxAmount) * 100)
+    }));
+  }, [financeEntries]);
+
+  const financeActivity = useMemo(() => {
+    const sorted = [...financeEntries].sort((a, b) => {
+      const dateA = resolveFinanceEntryDate(a)?.getTime() ?? 0;
+      const dateB = resolveFinanceEntryDate(b)?.getTime() ?? 0;
+      return dateB - dateA;
+    });
+    const recent = sorted.slice(0, 4);
+    const receipts = financeEntries.filter((entry) => entry.attachmentUrl).length;
+    const expenseEntries = financeEntries.filter((entry) => entry.type === "expense");
+    const averageExpense =
+      expenseEntries.length === 0
+        ? 0
+        : expenseEntries.reduce((sum, entry) => sum + Number(entry.amount ?? 0), 0) /
+          expenseEntries.length;
+    return {
+      totalEntries: financeEntries.length,
+      receipts,
+      averageExpense,
+      recent
+    };
   }, [financeEntries]);
 
   const handlePaidToggle = async (collectionName, order) => {
@@ -835,13 +1472,31 @@ function AdminDashboard({ user, role }) {
         specialPrice: livestockDraft.specialPrice ? Number(livestockDraft.specialPrice) : null,
         order: Date.now(),
         categoryId: livestockDraft.categoryId || "",
-        categoryName: category?.name ?? ""
+        categoryName: category?.name ?? "",
+        available: true
       });
       setLivestockDraft({ label: "", price: "", specialPrice: "", categoryId: "" });
       setLivestockMessage("Livestock item added.");
     } catch (err) {
       console.error("add livestock item error", err);
       setLivestockError("Unable to add livestock item.");
+    }
+  };
+
+  const handleToggleLivestockAvailability = async (item) => {
+    setLivestockError("");
+    setLivestockMessage("");
+    const nextAvailable = item.available === false;
+    try {
+      await updateDoc(doc(db, "livestockTypes", item.id), { available: nextAvailable });
+      setLivestockMessage(
+        nextAvailable
+          ? "Livestock item marked available."
+          : "Livestock item marked unavailable."
+      );
+    } catch (err) {
+      console.error("toggle livestock availability error", err);
+      setLivestockError("Unable to update availability.");
     }
   };
 
@@ -874,7 +1529,167 @@ function AdminDashboard({ user, role }) {
     }
   };
 
-  const handleUpdateStockItem = async (item, updates, logType = "stockLogs") => {
+  const updateStockUpdateDraft = (itemId, updates) => {
+    setStockUpdateDrafts((prev) => {
+      const current = prev[itemId] ?? {};
+      return { ...prev, [itemId]: { ...current, ...updates } };
+    });
+  };
+
+  const startVoiceNoteRecording = async () => {
+    setVoiceNoteError("");
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+      setVoiceNoteError("Recording is not supported in this browser.");
+      return;
+    }
+    try {
+      if (voiceNote?.previewUrl) {
+        URL.revokeObjectURL(voiceNote.previewUrl);
+      }
+      setVoiceNote(null);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaStreamRef.current = stream;
+      recordingChunksRef.current = [];
+      recordingStartRef.current = Date.now();
+      setVoiceNoteDuration(0);
+      if (recordingTimerRef.current) {
+        clearInterval(recordingTimerRef.current);
+      }
+      recordingTimerRef.current = setInterval(() => {
+        const startedAt = recordingStartRef.current ?? Date.now();
+        const seconds = Math.floor((Date.now() - startedAt) / 1000);
+        setVoiceNoteDuration(seconds);
+      }, 1000);
+
+      const mimeType = getVoiceNoteMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      mediaRecorderRef.current = recorder;
+      recorder.ondataavailable = (event) => {
+        if (event.data?.size) {
+          recordingChunksRef.current.push(event.data);
+        }
+      };
+      recorder.onstop = () => {
+        if (recordingTimerRef.current) {
+          clearInterval(recordingTimerRef.current);
+        }
+        const recordedAt = recordingStartRef.current ?? Date.now();
+        const durationSeconds = Math.max(
+          1,
+          Math.floor((Date.now() - recordedAt) / 1000)
+        );
+        const blob = new Blob(recordingChunksRef.current, {
+          type: recorder.mimeType || mimeType || "audio/webm"
+        });
+        if (blob.size > 0) {
+          const previewUrl = URL.createObjectURL(blob);
+          setVoiceNote({
+            blob,
+            previewUrl,
+            mimeType: blob.type,
+            size: blob.size,
+            duration: durationSeconds
+          });
+        } else {
+          setVoiceNoteError("Recording was empty. Please try again.");
+        }
+        setIsRecordingVoiceNote(false);
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+          mediaStreamRef.current = null;
+        }
+      };
+      recorder.start();
+      setIsRecordingVoiceNote(true);
+    } catch (err) {
+      console.error("voice note record error", err);
+      setVoiceNoteError("Unable to start recording.");
+      setIsRecordingVoiceNote(false);
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        mediaStreamRef.current = null;
+      }
+    }
+  };
+
+  const stopVoiceNoteRecording = () => {
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  const clearVoiceNote = () => {
+    if (voiceNote?.previewUrl) {
+      URL.revokeObjectURL(voiceNote.previewUrl);
+    }
+    setVoiceNote(null);
+    setVoiceNoteDuration(0);
+    setVoiceNoteError("");
+  };
+
+  const handleSubmitStockUpdates = async () => {
+    if (stockUpdateSubmitting) return;
+    const updates = stockItems.reduce((acc, item) => {
+      const draft = stockUpdateDrafts[item.id];
+      if (!draft) return acc;
+      const currentQuantity = Number(item.quantity ?? 0);
+      const nextQuantity = resolveStockUpdateQuantity(draft, currentQuantity);
+      const currentNotes = item.notes ?? "";
+      const nextNotes = draft.notes ?? currentNotes;
+      if (nextQuantity === currentQuantity && nextNotes === currentNotes) return acc;
+      acc.push({ item, quantity: nextQuantity, notes: nextNotes });
+      return acc;
+    }, []);
+
+    if (updates.length === 0) return;
+
+    setStockUpdateSubmitting(true);
+    try {
+      let voiceNoteMeta = {};
+      if (voiceNote?.blob) {
+        const extension = voiceNote.mimeType?.includes("ogg")
+          ? "ogg"
+          : voiceNote.mimeType?.includes("mp4")
+            ? "mp4"
+            : "webm";
+        const fileName = `voice_note_${Date.now()}.${extension}`;
+        const fileRef = storageRef(
+          storage,
+          `stock_updates/${user.uid ?? "unknown"}/${fileName}`
+        );
+        await uploadBytes(fileRef, voiceNote.blob, {
+          contentType: voiceNote.mimeType ?? voiceNote.blob.type ?? "audio/webm"
+        });
+        const url = await getDownloadURL(fileRef);
+        voiceNoteMeta = {
+          voiceNoteUrl: url,
+          voiceNoteName: fileName,
+          voiceNoteType: voiceNote.mimeType ?? voiceNote.blob.type ?? "",
+          voiceNoteSize: voiceNote.blob.size,
+          voiceNoteDuration: voiceNote.duration ?? null,
+          voiceNotePath: fileRef.fullPath
+        };
+      }
+
+      await Promise.all(
+        updates.map(({ item, quantity, notes }) =>
+          handleUpdateStockItem(item, { quantity, notes }, "stockUpdateLogs", voiceNoteMeta)
+        )
+      );
+      setStockUpdateDrafts({});
+      setVoiceNote(null);
+      setVoiceNoteDuration(0);
+    } finally {
+      setStockUpdateSubmitting(false);
+    }
+  };
+
+  const handleUpdateStockItem = async (
+    item,
+    updates,
+    logType = "stockLogs",
+    logMeta = {}
+  ) => {
     const fromQty = Number(item.quantity ?? 0);
     const toQty = Number(updates.quantity ?? fromQty);
     const change = toQty - fromQty;
@@ -886,7 +1701,7 @@ function AdminDashboard({ user, role }) {
         updatedBy: user.email ?? ""
       });
 
-    await addDoc(collection(db, logType), {
+      await addDoc(collection(db, logType), {
         itemId: item.id,
         name: item.name ?? "",
         summary: item.name ?? "",
@@ -895,7 +1710,8 @@ function AdminDashboard({ user, role }) {
         toQty,
         notes: updates.notes ?? "",
         userEmail: user.email ?? "",
-        createdAt: serverTimestamp()
+        createdAt: serverTimestamp(),
+        ...logMeta
       });
     } catch (err) {
       console.error("stock update error", err);
@@ -1071,6 +1887,7 @@ function AdminDashboard({ user, role }) {
         file: null
       });
       setFinanceMessage("Entry added.");
+      setShowFinanceForm(false);
     } catch (err) {
       console.error("add finance error", err);
       setFinanceError("Unable to add finance entry.");
@@ -1096,8 +1913,10 @@ function AdminDashboard({ user, role }) {
     window.setTimeout(() => setOrderActionMessage(""), 2500);
   };
 
+  const resolvedTab = isWorker ? "stock_updates" : activeTab;
+
   const getActiveFormLink = () => {
-    const path = activeTab === "livestock_orders" ? "/livestock" : "/eggs";
+    const path = resolvedTab === "livestock_orders" ? "/livestock" : "/eggs";
     if (typeof window === "undefined") return path;
     return `${window.location.origin}${path}`;
   };
@@ -1120,19 +1939,20 @@ function AdminDashboard({ user, role }) {
     window.open(shareUrl, "_blank", "noopener,noreferrer");
   };
 
-  const activeOrders = activeTab === "livestock_orders" ? filteredLivestockOrders : filteredEggOrders;
+  const activeOrders = resolvedTab === "livestock_orders" ? filteredLivestockOrders : filteredEggOrders;
   const activeOrderTitle =
-    activeTab === "livestock_orders" ? "Live Livestock Orders" : "Live Egg Orders";
-  const activeOrderCollection = activeTab === "livestock_orders" ? "livestockOrders" : "eggOrders";
-  const activeItemLabel = activeTab === "livestock_orders" ? "Livestock" : "Eggs";
+    resolvedTab === "livestock_orders" ? "Live Livestock Orders" : "Live Egg Orders";
+  const activeOrderCollection =
+    resolvedTab === "livestock_orders" ? "livestockOrders" : "eggOrders";
+  const activeItemLabel = resolvedTab === "livestock_orders" ? "Livestock" : "Eggs";
   const modalDeliveryOptions =
     selectedOrderCollection === "livestockOrders"
       ? resolvedLivestockDeliveryOptions
       : resolvedEggDeliveryOptions;
   const modalItemOptions =
     selectedOrderCollection === "livestockOrders" ? livestockTypes : resolvedEggTypes;
-  const isOrdersActive = activeTab === "orders" || activeTab === "livestock_orders";
-  const isTypesActive = activeTab === "eggs" || activeTab === "livestock_types";
+  const isOrdersActive = resolvedTab === "orders" || resolvedTab === "livestock_orders";
+  const isTypesActive = resolvedTab === "eggs" || resolvedTab === "livestock_types";
   const canSeeTypes = isAdmin;
   const toggleMenu = (menuId) =>
     setOpenMenu((prev) => (prev === menuId ? null : menuId));
@@ -1157,6 +1977,9 @@ function AdminDashboard({ user, role }) {
     { id: "finance", label: "Finance", adminOnly: true },
     { id: "reports", label: "Reports", adminOnly: true }
   ];
+  const visibleTabs = isWorker
+    ? tabs.filter((tab) => tab.id === "stock_updates")
+    : tabs.filter((tab) => !tab.adminOnly || isAdmin);
 
   return (
     <div className="space-y-6">
@@ -1178,44 +2001,46 @@ function AdminDashboard({ user, role }) {
       </div>
 
       <div className="flex flex-wrap gap-2">
-        <div className="relative" onClick={(event) => event.stopPropagation()}>
-          <button
-            type="button"
-            onClick={() => toggleMenu("orders")}
-            aria-haspopup="menu"
-            aria-expanded={openMenu === "orders"}
-            className={`rounded-full px-4 py-2 text-sm font-semibold shadow-sm transition ${
-              isOrdersActive
-                ? "bg-brandGreen text-white"
-                : "bg-white text-brandGreen border border-brandGreen/30"
-            }`}
-          >
-            Orders ▾
-          </button>
-          {openMenu === "orders" ? (
-            <div className="absolute left-0 z-20 mt-2 w-56 rounded-2xl border border-brandGreen/20 bg-white p-2 shadow-xl">
-              {orderTabs.map((tab) => (
-                <button
-                  key={tab.id}
-                  type="button"
-                  onClick={() => {
-                    setActiveTab(tab.id);
-                    setOpenMenu(null);
-                  }}
-                  className={`w-full rounded-full px-3 py-2 text-left text-sm font-semibold transition ${
-                    activeTab === tab.id
-                      ? "bg-brandGreen text-white"
-                      : "text-brandGreen hover:bg-brandBeige"
-                  }`}
-                >
-                  {tab.label}
-                </button>
-              ))}
-            </div>
-          ) : null}
-        </div>
+        {!isWorker ? (
+          <div className="relative" onClick={(event) => event.stopPropagation()}>
+            <button
+              type="button"
+              onClick={() => toggleMenu("orders")}
+              aria-haspopup="menu"
+              aria-expanded={openMenu === "orders"}
+              className={`rounded-full px-4 py-2 text-sm font-semibold shadow-sm transition ${
+                isOrdersActive
+                  ? "bg-brandGreen text-white"
+                  : "bg-white text-brandGreen border border-brandGreen/30"
+              }`}
+            >
+              Orders ▾
+            </button>
+            {openMenu === "orders" ? (
+              <div className="absolute left-0 z-20 mt-2 w-56 rounded-2xl border border-brandGreen/20 bg-white p-2 shadow-xl">
+                {orderTabs.map((tab) => (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => {
+                      setActiveTab(tab.id);
+                      setOpenMenu(null);
+                    }}
+                    className={`w-full rounded-full px-3 py-2 text-left text-sm font-semibold transition ${
+                      resolvedTab === tab.id
+                        ? "bg-brandGreen text-white"
+                        : "text-brandGreen hover:bg-brandBeige"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
 
-        {canSeeTypes ? (
+        {canSeeTypes && !isWorker ? (
           <div className="relative" onClick={(event) => event.stopPropagation()}>
             <button
               type="button"
@@ -1243,7 +2068,7 @@ function AdminDashboard({ user, role }) {
                         setOpenMenu(null);
                       }}
                       className={`w-full rounded-full px-3 py-2 text-left text-sm font-semibold transition ${
-                        activeTab === tab.id
+                        resolvedTab === tab.id
                           ? "bg-brandGreen text-white"
                           : "text-brandGreen hover:bg-brandBeige"
                       }`}
@@ -1256,25 +2081,23 @@ function AdminDashboard({ user, role }) {
           </div>
         ) : null}
 
-        {tabs
-          .filter((tab) => !tab.adminOnly || isAdmin)
-          .map((tab) => (
-            <button
-              key={tab.id}
-              type="button"
-              onClick={() => setActiveTab(tab.id)}
-              className={`rounded-full px-4 py-2 text-sm font-semibold shadow-sm transition ${
-                activeTab === tab.id
-                  ? "bg-brandGreen text-white"
-                  : "bg-white text-brandGreen border border-brandGreen/30"
-              }`}
-            >
-              {tab.label}
-            </button>
-          ))}
+        {visibleTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            onClick={() => setActiveTab(tab.id)}
+            className={`rounded-full px-4 py-2 text-sm font-semibold shadow-sm transition ${
+              resolvedTab === tab.id
+                ? "bg-brandGreen text-white"
+                : "bg-white text-brandGreen border border-brandGreen/30"
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
 
-      {(activeTab === "orders" || activeTab === "livestock_orders") && (
+      {(resolvedTab === "orders" || resolvedTab === "livestock_orders") && (
         <div className="space-y-3 rounded-2xl border border-brandGreen/10 bg-white/70 p-4 shadow-inner">
           <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
             <div>
@@ -1288,6 +2111,12 @@ function AdminDashboard({ user, role }) {
               <div className="rounded-full bg-white/70 px-4 py-2 shadow-inner">
                 Total orders: <span className="font-semibold">{activeOrders.length}</span>
               </div>
+              {resolvedTab === "orders" ? (
+                <div className="rounded-full bg-white/70 px-4 py-2 shadow-inner">
+                  Eggs ready for dispatch:{" "}
+                  <span className="font-semibold">{readyDispatchEggCount}</span>
+                </div>
+              ) : null}
             </div>
           </div>
 
@@ -1589,7 +2418,7 @@ function AdminDashboard({ user, role }) {
         </div>
       )}
 
-      {activeTab === "eggs" && (
+      {resolvedTab === "eggs" && (
         <div className={panelClass}>
           <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
             <div>
@@ -1702,7 +2531,10 @@ function AdminDashboard({ user, role }) {
                         }
                         placeholder="Special price"
                       />
-                      <div className="flex flex-wrap gap-2 md:justify-end">
+                      <div
+                        className="flex flex-wrap items-center gap-2 md:justify-end"
+                        onClick={(event) => event.stopPropagation()}
+                      >
                         <span
                           className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
                             isAvailable
@@ -1712,31 +2544,57 @@ function AdminDashboard({ user, role }) {
                         >
                           {isAvailable ? "Available" : "Unavailable"}
                         </span>
-                        <button
-                          type="button"
-                          onClick={() => handleSaveEggType(item.id)}
-                          className="rounded-full bg-brandGreen px-3 py-1 text-xs font-semibold text-white shadow-sm transition hover:shadow-md"
-                        >
-                          Save
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleToggleEggAvailability(item)}
-                          className={`rounded-full border px-3 py-1 text-xs font-semibold transition ${
-                            isAvailable
-                              ? "border-amber-300 text-amber-800 hover:bg-amber-50"
-                              : "border-emerald-300 text-emerald-800 hover:bg-emerald-50"
-                          }`}
-                        >
-                          {isAvailable ? "Mark unavailable" : "Mark available"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteEggType(item.id)}
-                          className="rounded-full border border-red-300 px-3 py-1 text-xs font-semibold text-red-700 transition hover:bg-red-50"
-                        >
-                          Delete
-                        </button>
+                        <div className="relative">
+                          <button
+                            type="button"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              toggleMenu(`egg-type-${item.id}`);
+                            }}
+                            aria-haspopup="menu"
+                            aria-expanded={openMenu === `egg-type-${item.id}`}
+                            className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-brandGreen text-white shadow-sm transition hover:shadow-md"
+                          >
+                            ...
+                          </button>
+                          {openMenu === `egg-type-${item.id}` ? (
+                            <div
+                              className="absolute right-0 z-20 mt-2 w-44 rounded-2xl border border-brandGreen/20 bg-white p-2 shadow-xl"
+                              onClick={(event) => event.stopPropagation()}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handleSaveEggType(item.id);
+                                  setOpenMenu(null);
+                                }}
+                                className="w-full rounded-full px-3 py-2 text-left text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+                              >
+                                Save
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handleToggleEggAvailability(item);
+                                  setOpenMenu(null);
+                                }}
+                                className="w-full rounded-full px-3 py-2 text-left text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+                              >
+                                {isAvailable ? "Mark unavailable" : "Mark available"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handleDeleteEggType(item.id);
+                                  setOpenMenu(null);
+                                }}
+                                className="w-full rounded-full px-3 py-2 text-left text-xs font-semibold text-red-700 transition hover:bg-red-50"
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          ) : null}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -1747,7 +2605,7 @@ function AdminDashboard({ user, role }) {
         </div>
       )}
 
-      {activeTab === "delivery" && (
+      {resolvedTab === "delivery" && (
         <DeliveryOptionsPanel
           title="Delivery methods"
           description="Manage delivery options for egg orders."
@@ -1780,7 +2638,7 @@ function AdminDashboard({ user, role }) {
         />
       )}
 
-      {activeTab === "livestock_delivery" && (
+      {resolvedTab === "livestock_delivery" && (
         <DeliveryOptionsPanel
           title="Livestock delivery methods"
           description="Manage delivery options for livestock orders."
@@ -1817,7 +2675,7 @@ function AdminDashboard({ user, role }) {
         />
       )}
 
-      {activeTab === "livestock_types" && (
+      {resolvedTab === "livestock_types" && (
         <div className={panelClass}>
           <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
             <div>
@@ -2017,10 +2875,13 @@ function AdminDashboard({ user, role }) {
                             specialPrice: item.specialPrice ?? "",
                             categoryId: item.categoryId ?? ""
                           };
+                          const isAvailable = item.available !== false;
                           return (
                             <div
                               key={item.id}
-                              className="rounded-lg border border-brandGreen/15 bg-white px-3 py-2 shadow-sm"
+                              className={`rounded-lg border border-brandGreen/15 bg-white px-3 py-2 shadow-sm ${
+                                isAvailable ? "" : "opacity-70"
+                              }`}
                             >
                               <div className="grid gap-2 md:grid-cols-2">
                                 <input
@@ -2075,21 +2936,70 @@ function AdminDashboard({ user, role }) {
                                   placeholder="Special price"
                                 />
                               </div>
-                              <div className="mt-2 flex flex-wrap gap-2">
-                                <button
-                                  type="button"
-                                  onClick={() => handleSaveLivestockType(item.id)}
-                                  className="rounded-full bg-brandGreen px-3 py-1 text-xs font-semibold text-white shadow-sm transition hover:shadow-md"
+                              <div
+                                className="mt-2 flex flex-wrap items-center gap-2"
+                                onClick={(event) => event.stopPropagation()}
+                              >
+                                <span
+                                  className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ${
+                                    isAvailable
+                                      ? "bg-emerald-100 text-emerald-800 border border-emerald-200"
+                                      : "bg-amber-100 text-amber-800 border border-amber-200"
+                                  }`}
                                 >
-                                  Save
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteLivestockType(item.id)}
-                                  className="rounded-full border border-red-300 px-3 py-1 text-xs font-semibold text-red-700 transition hover:bg-red-50"
-                                >
-                                  Delete
-                                </button>
+                                  {isAvailable ? "Available" : "Unavailable"}
+                                </span>
+                                <div className="relative">
+                                  <button
+                                    type="button"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      toggleMenu(`livestock-type-${item.id}`);
+                                    }}
+                                    aria-haspopup="menu"
+                                    aria-expanded={openMenu === `livestock-type-${item.id}`}
+                                    className="inline-flex h-8 w-8 items-center justify-center rounded-full bg-brandGreen text-white shadow-sm transition hover:shadow-md"
+                                  >
+                                    ...
+                                  </button>
+                                  {openMenu === `livestock-type-${item.id}` ? (
+                                    <div
+                                      className="absolute right-0 z-20 mt-2 w-44 rounded-2xl border border-brandGreen/20 bg-white p-2 shadow-xl"
+                                      onClick={(event) => event.stopPropagation()}
+                                    >
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          handleSaveLivestockType(item.id);
+                                          setOpenMenu(null);
+                                        }}
+                                        className="w-full rounded-full px-3 py-2 text-left text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+                                      >
+                                        Save
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          handleToggleLivestockAvailability(item);
+                                          setOpenMenu(null);
+                                        }}
+                                        className="w-full rounded-full px-3 py-2 text-left text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+                                      >
+                                        {isAvailable ? "Mark unavailable" : "Mark available"}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          handleDeleteLivestockType(item.id);
+                                          setOpenMenu(null);
+                                        }}
+                                        className="w-full rounded-full px-3 py-2 text-left text-xs font-semibold text-red-700 transition hover:bg-red-50"
+                                      >
+                                        Delete
+                                      </button>
+                                    </div>
+                                  ) : null}
+                                </div>
                               </div>
                             </div>
                           );
@@ -2104,7 +3014,7 @@ function AdminDashboard({ user, role }) {
         </div>
       )}
 
-      {activeTab === "inventory" && (
+      {resolvedTab === "inventory" && (
         <div className={panelClass}>
           <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
             <div>
@@ -2344,113 +3254,392 @@ function AdminDashboard({ user, role }) {
         </div>
       )}
 
-      {activeTab === "stock_logs" && (
+      {resolvedTab === "stock_logs" && (
         <div className={panelClass}>
-          <h2 className="text-xl font-bold text-brandGreen">Stock logs</h2>
-          <p className={mutedText}>Recent inventory adjustments.</p>
-          <div className="mt-4 space-y-2">
-            {stockLogs.length === 0 ? (
-              <p className={mutedText}>No stock logs yet.</p>
-            ) : (
-              stockLogs.map((log) => (
-                <div key={log.id} className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
-                  <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
-                        {formatDate(log.createdAt)}
-                      </p>
-                      <p className="font-semibold text-brandGreen">{log.summary || log.name}</p>
-                      <p className="text-sm text-brandGreen/70">{log.notes}</p>
-                    </div>
-                    <div className="text-right">
-                      <p className="text-sm font-semibold text-brandGreen">
-                        {log.change >= 0 ? "+" : ""}
-                        {log.change}
-                      </p>
-                      <p className="text-xs text-brandGreen/60">
-                        {log.fromQty} - {log.toQty}
-                      </p>
-                    </div>
-                  </div>
-                </div>
-              ))
-            )}
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="text-sm font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                Stock history
+              </p>
+              <h2 className="text-xl font-bold text-brandGreen">Stock logs</h2>
+              <p className={mutedText}>
+                Track who changed inventory, when it happened, and any notes. Search scans
+                the loaded logs; load all to search further back.
+              </p>
+            </div>
+            <div className="flex flex-col gap-2 md:items-end">
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAllStockLogs(true)}
+                  disabled={showAllStockLogs || stockLogs.length <= STOCK_LOG_LIMIT}
+                  className="rounded-full border border-brandGreen/30 px-4 py-2 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Load all
+                </button>
+                <span className="rounded-full bg-white/80 px-3 py-1 text-xs font-semibold text-brandGreen shadow-inner">
+                  {visibleStockLogs.length} logs loaded
+                </span>
+              </div>
+              <p className="text-xs text-brandGreen/60">
+                {showAllStockLogs || stockLogs.length <= STOCK_LOG_LIMIT
+                  ? "Showing all loaded entries."
+                  : `Showing the newest ${STOCK_LOG_LIMIT} entries.`}
+              </p>
+            </div>
           </div>
+
+          <div className="mt-4 grid gap-3 md:grid-cols-[2fr_1fr] md:items-end">
+            <div className="space-y-1">
+              <label className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+                Search by item, user, or notes
+              </label>
+              <input
+                placeholder="e.g. feed, John, -5, note text"
+                className={inputClass}
+                type="text"
+                value={stockLogSearch}
+                onChange={(event) => setStockLogSearch(event.target.value)}
+              />
+            </div>
+            <div className="rounded-lg border border-brandGreen/10 bg-brandBeige/60 p-3 text-xs text-brandGreen/70">
+              Search only covers the loaded entries.
+              <br />
+              Use "Load all" to search the full history.
+            </div>
+          </div>
+
+          {stockLogs.length === 0 ? (
+            <div className="mt-4 rounded-xl border border-dashed border-brandGreen/30 bg-white/70 px-4 py-6 text-sm text-brandGreen/70">
+              No stock logs yet.
+            </div>
+          ) : (
+            <>
+              <div className="mt-4 hidden overflow-x-auto md:block">
+                <table className="w-full min-w-[900px] text-left text-sm text-brandGreen">
+                  <thead className="bg-brandGreen text-white">
+                    <tr>
+                      <th className="px-3 py-2 font-semibold">When</th>
+                      <th className="px-3 py-2 font-semibold">Item</th>
+                      <th className="px-3 py-2 font-semibold">Change</th>
+                      <th className="px-3 py-2 font-semibold">Qty</th>
+                      <th className="px-3 py-2 font-semibold">User</th>
+                      <th className="px-3 py-2 font-semibold">Notes</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredStockLogs.map((log, index) => {
+                      const entries = getLogEntries(log);
+                      const title = getLogTitle(log, entries);
+                      const user = log.userEmail ?? log.updatedBy ?? "-";
+                      const rowClass = index % 2 === 0 ? "bg-white" : "bg-brandBeige/60";
+                      return (
+                        <tr key={log.id} className={rowClass}>
+                          <td className="whitespace-nowrap px-3 py-2 align-top">
+                            {formatTimestamp(log.createdAt)}
+                          </td>
+                          <td className="px-3 py-2 align-top">
+                            <div className="font-semibold">{title}</div>
+                            {entries.length === 1 && log.itemId ? (
+                              <p className="text-xs text-brandGreen/60">ID: {log.itemId}</p>
+                            ) : null}
+                          </td>
+                          <td className="px-3 py-2 align-top">
+                            <div className="space-y-1">
+                              {entries.map((entry, entryIndex) => (
+                                <div
+                                  key={`${log.id}-change-${entryIndex}`}
+                                  className={`flex items-center justify-between gap-2 text-sm font-semibold ${getChangeColor(
+                                    entry.change
+                                  )}`}
+                                >
+                                  <span className="text-brandGreen">{entry.name}</span>
+                                  <span>{formatChangeValue(entry.change)}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2 align-top">
+                            <div className="space-y-1 text-sm text-brandGreen">
+                              {entries.map((entry, entryIndex) => (
+                                <div
+                                  key={`${log.id}-qty-${entryIndex}`}
+                                  className="flex items-center justify-between gap-2"
+                                >
+                                  <span className="text-brandGreen/70">{entry.name}</span>
+                                  <span className="font-semibold">
+                                    {entry.fromQty} → {entry.toQty}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </td>
+                          <td className="px-3 py-2 align-top">{user}</td>
+                          <td className="px-3 py-2 align-top">
+                            {entries.length > 1 ? (
+                              <div className="space-y-1 text-sm">
+                                {entries.map((entry, entryIndex) => (
+                                  <div
+                                    key={`${log.id}-note-${entryIndex}`}
+                                    className="flex items-center justify-between gap-2"
+                                  >
+                                    <span className="font-semibold text-brandGreen">
+                                      {entry.name}
+                                    </span>
+                                    <span className="text-brandGreen/80">
+                                      {formatChangeValue(entry.change)} ({entry.fromQty} →{" "}
+                                      {entry.toQty})
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            ) : log.notes ? (
+                              <div className="space-y-1">
+                                <p className="m-0 text-sm text-brandGreen/80">{log.notes}</p>
+                              </div>
+                            ) : (
+                              <span className="text-xs text-brandGreen/60">-</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="mt-4 grid gap-3 md:hidden">
+                {filteredStockLogs.map((log) => {
+                  const entries = getLogEntries(log);
+                  const title = getLogTitle(log, entries);
+                  const user = log.userEmail ?? log.updatedBy ?? "-";
+                  return (
+                    <div
+                      key={log.id}
+                      className="space-y-1 rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="font-semibold text-brandGreen">{title}</div>
+                        <span className="text-xs text-brandGreen/60">
+                          {formatTimestamp(log.createdAt)}
+                        </span>
+                      </div>
+                      <div className="space-y-1 text-sm">
+                        {entries.map((entry, entryIndex) => (
+                          <div
+                            key={`${log.id}-mobile-${entryIndex}`}
+                            className="flex items-center justify-between gap-2"
+                          >
+                            <span className="font-semibold text-brandGreen">{entry.name}</span>
+                            <span className={getChangeColor(entry.change)}>
+                              {formatChangeValue(entry.change)} ({entry.fromQty} →{" "}
+                              {entry.toQty})
+                            </span>
+                          </div>
+                        ))}
+                        <p className="text-xs text-brandGreen/70">By {user}</p>
+                        {entries.length === 1 && log.notes ? (
+                          <p className="text-xs text-brandGreen/70">
+                            Notes: {log.notes}
+                          </p>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
         </div>
       )}
 
-      {activeTab === "stock_updates" && (
+      {resolvedTab === "stock_updates" && (
         <div className={panelClass}>
-          <h2 className="text-xl font-bold text-brandGreen">Stock updates</h2>
-          <p className={mutedText}>
-            Submit quick stock updates. Each update logs the change and updates inventory.
-          </p>
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="text-sm font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                Daily updates
+              </p>
+              <h2 className="text-xl font-bold text-brandGreen">
+                Inventory (admin-created categories)
+              </h2>
+              <p className={mutedText}>
+                Workers can only update existing categories/items that admins created. If nothing
+                shows, ask an admin to add inventory first.
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-4 space-y-2 rounded-2xl border border-brandGreen/10 bg-brandBeige/60 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-brandGreen">General voice note</p>
+                <p className="text-xs text-brandGreen/70">
+                  Optional. Attached to every stock log created in this submission.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={isRecordingVoiceNote ? stopVoiceNoteRecording : startVoiceNoteRecording}
+                disabled={stockUpdateSubmitting}
+                className="rounded-full border border-brandGreen/30 px-4 py-2 text-sm font-semibold text-brandGreen shadow-sm transition hover:bg-brandBeige disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isRecordingVoiceNote
+                  ? `Stop recording (${formatDuration(voiceNoteDuration)})`
+                  : voiceNote
+                    ? "Record new voice note"
+                    : "Record voice note"}
+              </button>
+              {voiceNote ? (
+                <button
+                  type="button"
+                  onClick={clearVoiceNote}
+                  disabled={stockUpdateSubmitting || isRecordingVoiceNote}
+                  className="rounded-full border border-brandGreen/30 px-4 py-2 text-sm font-semibold text-brandGreen shadow-sm transition hover:bg-brandBeige disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Clear voice note
+                </button>
+              ) : null}
+            </div>
+            {voiceNoteError ? (
+              <p className="text-xs text-red-700">{voiceNoteError}</p>
+            ) : null}
+            {isRecordingVoiceNote ? (
+              <p className="text-xs text-brandGreen/70">Recording...</p>
+            ) : voiceNote ? (
+              <div className="flex flex-wrap items-center gap-3 text-xs text-brandGreen/70">
+                <span>Voice note ready ({formatDuration(voiceNote.duration ?? 0)})</span>
+                {voiceNote.previewUrl ? (
+                  <audio controls className="h-8 w-56" src={voiceNote.previewUrl} />
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+
           <div className="mt-4 space-y-3">
-            {stockItems.length === 0 ? (
-              <p className={mutedText}>No stock items to update.</p>
+            <div className="flex flex-wrap gap-2 overflow-x-auto rounded-xl border border-brandGreen/15 bg-white/70 px-3 py-2">
+              {stockUpdateCategoryOptions.map((option) => (
+                <button
+                  key={option.id}
+                  type="button"
+                  onClick={() => setStockUpdateCategoryFilter(option.id)}
+                  className={`rounded-full px-3 py-1 text-sm font-semibold transition ${
+                    option.id === stockUpdateCategoryFilter
+                      ? "bg-brandGreen text-white shadow-sm"
+                      : "bg-brandBeige/80 text-brandGreen shadow-inner"
+                  }`}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+
+            {stockUpdateGroups.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-brandGreen/30 bg-white/70 px-4 py-6 text-sm text-brandGreen/70">
+                No stock items to update.
+              </div>
             ) : (
-              stockItems.map((item) => (
-                <div key={item.id} className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
-                  <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-                    <div>
-                      <p className="font-semibold text-brandGreen">{item.name}</p>
-                      <p className="text-xs text-brandGreen/60">
-                        Current qty: {item.quantity ?? 0}
-                      </p>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      <input
-                        type="number"
-                        className="w-24 rounded-lg border border-brandGreen/30 bg-brandCream px-2 py-1 text-right text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
-                        value={item.quantity ?? 0}
-                        onChange={(event) =>
-                          setStockItems((prev) =>
-                            prev.map((current) =>
-                              current.id === item.id
-                                ? { ...current, quantity: Number(event.target.value) }
-                                : current
-                            )
-                          )
-                        }
-                      />
-                      <input
-                        type="text"
-                        className="w-48 rounded-lg border border-brandGreen/30 bg-brandCream px-2 py-1 text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
-                        value={item.notes ?? ""}
-                        onChange={(event) =>
-                          setStockItems((prev) =>
-                            prev.map((current) =>
-                              current.id === item.id
-                                ? { ...current, notes: event.target.value }
-                                : current
-                            )
-                          )
-                        }
-                        placeholder="Notes"
-                      />
-                      <button
-                        type="button"
-                        onClick={() =>
-                          handleUpdateStockItem(
-                            item,
-                            { quantity: item.quantity ?? 0, notes: item.notes ?? "" },
-                            "stockUpdateLogs"
-                          )
-                        }
-                        className="rounded-full bg-brandGreen px-3 py-1 text-xs font-semibold text-white shadow-sm transition hover:shadow-md"
+              stockUpdateGroups.map((category) => (
+                <div
+                  key={category.key}
+                  className="space-y-2 rounded-xl border border-brandGreen/15 bg-brandBeige/60 p-4"
+                >
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-lg font-semibold text-brandGreen">{category.label}</h3>
+                    <span className="text-xs uppercase tracking-wide text-brandGreen/60">
+                      Admin-managed
+                    </span>
+                  </div>
+                  <div className="space-y-3">
+                    {category.subGroups.map((subGroup) => (
+                      <div
+                        key={`${category.key}-${subGroup.key}`}
+                        className="space-y-2 rounded-lg border border-brandGreen/15 bg-white px-3 py-3 shadow-sm"
                       >
-                        Submit update
-                      </button>
-                    </div>
+                        <div className="flex items-center justify-between">
+                          <p className="font-semibold text-brandGreen">{subGroup.label}</p>
+                          <span className="text-xs text-brandGreen/60">
+                            {subGroup.items.length}{" "}
+                            {subGroup.items.length === 1 ? "item" : "items"}
+                          </span>
+                        </div>
+                        <div className="grid gap-3 md:grid-cols-2">
+                          {subGroup.items.map((item) => {
+                            const draft = stockUpdateDrafts[item.id] ?? {};
+                            const quantityValue = draft.quantity ?? item.quantity ?? 0;
+                            const notesValue = draft.notes ?? item.notes ?? "";
+                            return (
+                              <div
+                                key={item.id}
+                                className="rounded-lg border border-brandGreen/10 bg-brandBeige/40 px-3 py-3 shadow-sm"
+                              >
+                                <div className="flex items-center justify-between">
+                                  <div>
+                                    <p className="font-semibold text-brandGreen">{item.name}</p>
+                                    <p className="text-xs font-semibold text-brandGreen">
+                                      Current:{" "}
+                                      <span className="inline-block rounded-full bg-brandGreen/10 px-2 py-1 text-brandGreen">
+                                        {Number(item.quantity ?? 0)}
+                                      </span>
+                                    </p>
+                                  </div>
+                                  <span className="text-[11px] text-brandGreen/60">
+                                    {item.updatedBy ?? "-"}
+                                  </span>
+                                </div>
+                                <div className="mt-2 grid gap-2">
+                                  <input
+                                    type="number"
+                                    className="w-full rounded-lg border border-brandGreen/30 bg-brandCream px-3 py-2 text-right text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
+                                    value={quantityValue}
+                                    onChange={(event) =>
+                                      updateStockUpdateDraft(item.id, {
+                                        quantity: event.target.value
+                                      })
+                                    }
+                                  />
+                                  <textarea
+                                    rows="2"
+                                    className="w-full rounded-lg border border-brandGreen/30 bg-brandCream px-3 py-2 text-brandGreen focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30"
+                                    value={notesValue}
+                                    onChange={(event) =>
+                                      updateStockUpdateDraft(item.id, {
+                                        notes: event.target.value
+                                      })
+                                    }
+                                    placeholder="Notes (optional)"
+                                  />
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
               ))
             )}
           </div>
+
+          <div className="mt-4 flex flex-wrap justify-end gap-2">
+            <button
+              type="button"
+              onClick={handleSubmitStockUpdates}
+              disabled={
+                !hasPendingStockUpdates || stockUpdateSubmitting || isRecordingVoiceNote
+              }
+              className="rounded-full bg-brandGreen px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {stockUpdateSubmitting ? "Submitting..." : "Submit all updates"}
+            </button>
+          </div>
         </div>
       )}
 
-      {activeTab === "users" && (
+      {resolvedTab === "users" && (
         <div className={panelClass}>
           <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
             <div>
@@ -2540,163 +3729,596 @@ function AdminDashboard({ user, role }) {
         </div>
       )}
 
-      {activeTab === "finance" && (
-        <div className={panelClass}>
+      {resolvedTab === "finance" && (
+        <div className="space-y-4 rounded-2xl border border-brandGreen/10 bg-white/70 p-4 shadow-inner">
           <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
             <div>
               <p className="text-sm font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
                 Finance
               </p>
-              <h2 className="text-xl font-bold text-brandGreen">Income & expenses</h2>
-              <p className={mutedText}>Track payments, expenses, and attachments.</p>
+              <h2 className="text-xl font-bold text-brandGreen">
+                Record income & expenses
+              </h2>
+              <p className={mutedText}>
+                Upload receipts or proofs next to each entry for future reporting.
+              </p>
             </div>
-            {financeMessage ? (
-              <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-800">
-                {financeMessage}
-              </span>
-            ) : null}
+            <div className="text-sm text-brandGreen/70">
+              <p>
+                Income:{" "}
+                <span className="font-semibold text-emerald-700">
+                  {formatCurrency(financeTotals.income)}
+                </span>
+              </p>
+              <p>
+                Expenses:{" "}
+                <span className="font-semibold text-red-700">
+                  {formatCurrency(financeTotals.expense)}
+                </span>
+              </p>
+              <p>
+                Balance:{" "}
+                <span
+                  className={`font-semibold ${
+                    financeBalance >= 0 ? "text-emerald-700" : "text-red-700"
+                  }`}
+                >
+                  {formatCurrency(financeBalance)}
+                </span>
+              </p>
+            </div>
           </div>
 
+          {financeMessage ? (
+            <span className="inline-flex rounded-full bg-emerald-100 px-3 py-1 text-xs font-semibold text-emerald-800">
+              {financeMessage}
+            </span>
+          ) : null}
           {financeError ? (
             <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
               {financeError}
             </div>
           ) : null}
 
-          <div className="mt-4 grid gap-3 md:grid-cols-3">
-            <select
-              className={inputClass}
-              value={financeDraft.type}
-              onChange={(event) =>
-                setFinanceDraft((prev) => ({ ...prev, type: event.target.value }))
-              }
-            >
-              <option value="income">Income</option>
-              <option value="expense">Expense</option>
-            </select>
-            <input
-              type="number"
-              className={inputClass}
-              value={financeDraft.amount}
-              onChange={(event) =>
-                setFinanceDraft((prev) => ({ ...prev, amount: event.target.value }))
-              }
-              placeholder="Amount"
-            />
-            <input
-              type="date"
-              className={inputClass}
-              value={financeDraft.date}
-              onChange={(event) =>
-                setFinanceDraft((prev) => ({ ...prev, date: event.target.value }))
-              }
-            />
-          </div>
-          <div className="mt-3 grid gap-3 md:grid-cols-2">
-            <input
-              type="text"
-              className={inputClass}
-              value={financeDraft.description}
-              onChange={(event) =>
-                setFinanceDraft((prev) => ({ ...prev, description: event.target.value }))
-              }
-              placeholder="Description"
-            />
-            <input
-              type="file"
-              className={inputClass}
-              onChange={(event) =>
-                setFinanceDraft((prev) => ({ ...prev, file: event.target.files?.[0] ?? null }))
-              }
-            />
-          </div>
-          <div className="mt-3 flex justify-end">
-            <button
-              type="button"
-              onClick={handleAddFinance}
-              className="rounded-full bg-brandGreen px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:shadow-md"
-            >
-              Add entry
-            </button>
+          <div className="space-y-3 rounded-[32px] border border-brandGreen/30 bg-brandBeige/80 p-5 shadow-xl">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <p className="text-sm text-brandGreen/70">
+                Add income or expense entries to keep the ledger up to date.
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowFinanceForm((prev) => !prev)}
+                className="rounded-3xl bg-brandGreen px-6 py-3 text-sm font-semibold text-white shadow-[0_10px_25px_rgba(58,90,60,0.35)] transition hover:scale-[1.02] hover:bg-emerald-700"
+              >
+                {showFinanceForm ? "Hide entry form" : "Add entry"}
+              </button>
+            </div>
           </div>
 
-          <div className="mt-4 space-y-2">
-            {financeEntries.length === 0 ? (
-              <p className={mutedText}>No finance entries yet.</p>
-            ) : (
-              financeEntries.map((entry) => (
-                <div key={entry.id} className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
-                  <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-                    <div>
-                      <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
-                        {entry.type === "income" ? "Income" : "Expense"} - {entry.date ?? "-"}
-                      </p>
-                      <p className="text-sm text-brandGreen">{entry.description}</p>
-                    </div>
-                    <span
-                      className={`text-lg font-semibold ${
-                        entry.type === "income" ? "text-emerald-700" : "text-red-700"
-                      }`}
-                    >
-                      R{Number(entry.amount ?? 0).toFixed(2)}
-                    </span>
-                  </div>
-                  {entry.attachmentUrl ? (
-                    <a
-                      href={entry.attachmentUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="mt-3 inline-flex items-center gap-2 text-xs font-semibold text-brandGreen underline decoration-brandGreen/40 underline-offset-4"
-                    >
-                      {entry.attachmentName ?? "View attachment"}
-                    </a>
-                  ) : null}
+          {showFinanceForm ? (
+            <div className="space-y-3 rounded-xl border border-brandGreen/15 bg-white px-4 py-4 shadow-sm">
+              <div className="grid gap-3 md:grid-cols-3">
+                <select
+                  className={inputClass}
+                  value={financeDraft.type}
+                  onChange={(event) =>
+                    setFinanceDraft((prev) => ({ ...prev, type: event.target.value }))
+                  }
+                >
+                  <option value="income">Income</option>
+                  <option value="expense">Expense</option>
+                </select>
+                <input
+                  type="number"
+                  className={inputClass}
+                  value={financeDraft.amount}
+                  onChange={(event) =>
+                    setFinanceDraft((prev) => ({ ...prev, amount: event.target.value }))
+                  }
+                  placeholder="Amount"
+                />
+                <input
+                  type="date"
+                  className={inputClass}
+                  value={financeDraft.date}
+                  onChange={(event) =>
+                    setFinanceDraft((prev) => ({ ...prev, date: event.target.value }))
+                  }
+                />
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <input
+                  type="text"
+                  className={inputClass}
+                  value={financeDraft.description}
+                  onChange={(event) =>
+                    setFinanceDraft((prev) => ({ ...prev, description: event.target.value }))
+                  }
+                  placeholder="Description"
+                />
+                <input
+                  type="file"
+                  className={inputClass}
+                  onChange={(event) =>
+                    setFinanceDraft((prev) => ({
+                      ...prev,
+                      file: event.target.files?.[0] ?? null
+                    }))
+                  }
+                />
+              </div>
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={handleAddFinance}
+                  className="rounded-full bg-brandGreen px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:shadow-md"
+                >
+                  Add entry
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          <div className="space-y-4 rounded-xl border border-brandGreen/20 bg-white/95 px-4 py-4 shadow-lg">
+            <div className="rounded-2xl border border-brandGreen/40 bg-brandCream/80 p-3 shadow-md">
+              <div className="flex items-center justify-between gap-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                  Filters & sorting
+                </p>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-brandGreen/70">
+                    Showing {filteredFinanceEntries.length} records
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setFinanceShowFilters((prev) => !prev)}
+                    className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70"
+                  >
+                    {financeShowFilters ? "Hide filters" : "Show filters"}
+                  </button>
                 </div>
-              ))
-            )}
+              </div>
+              {financeShowFilters ? (
+                <>
+                  <div className="mt-3 grid gap-3 md:grid-cols-4">
+                    <div className="space-y-1 text-sm text-brandGreen">
+                      <label className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                        Time scope
+                      </label>
+                      <select
+                        className={inputClass}
+                        value={financeTimeScope}
+                        onChange={(event) => setFinanceTimeScope(event.target.value)}
+                      >
+                        <option value="day">Day</option>
+                        <option value="week">Week</option>
+                        <option value="month">Month</option>
+                        <option value="year">Year</option>
+                      </select>
+                    </div>
+                    <div className="space-y-1 text-sm text-brandGreen">
+                      <label className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                        Month
+                      </label>
+                      <input
+                        className={`${inputClass} disabled:cursor-not-allowed disabled:opacity-60`}
+                        type="month"
+                        value={financeMonth}
+                        onChange={(event) => setFinanceMonth(event.target.value)}
+                        disabled={financeTimeScope === "day" || financeTimeScope === "week"}
+                      />
+                    </div>
+                    <div className="space-y-1 text-sm text-brandGreen">
+                      <label className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                        Sort by
+                      </label>
+                      <select
+                        className={inputClass}
+                        value={financeSort}
+                        onChange={(event) => setFinanceSort(event.target.value)}
+                      >
+                        <option value="dateDesc">Date ↓</option>
+                        <option value="dateAsc">Date ↑</option>
+                        <option value="amountDesc">Amount ↓</option>
+                        <option value="amountAsc">Amount ↑</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid gap-3 md:grid-cols-3">
+                    <div className="space-y-1 text-sm text-brandGreen">
+                      <label
+                        className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70"
+                        htmlFor="finance-min-amount"
+                      >
+                        Min amount
+                      </label>
+                      <input
+                        id="finance-min-amount"
+                        step="0.01"
+                        min="0"
+                        className={inputClass}
+                        type="number"
+                        value={financeMinAmount}
+                        onChange={(event) => setFinanceMinAmount(event.target.value)}
+                      />
+                    </div>
+                    <div className="space-y-1 text-sm text-brandGreen">
+                      <label
+                        className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70"
+                        htmlFor="finance-max-amount"
+                      >
+                        Max amount
+                      </label>
+                      <input
+                        id="finance-max-amount"
+                        step="0.01"
+                        min="0"
+                        className={inputClass}
+                        type="number"
+                        value={financeMaxAmount}
+                        onChange={(event) => setFinanceMaxAmount(event.target.value)}
+                      />
+                    </div>
+                    <div className="flex items-end justify-between gap-3">
+                      <label className="inline-flex items-center gap-2 text-sm font-semibold text-brandGreen">
+                        <input
+                          className="h-4 w-4 rounded border-brandGreen text-brandGreen focus:ring-brandGreen"
+                          type="checkbox"
+                          checked={financeHasReceipt}
+                          onChange={(event) => setFinanceHasReceipt(event.target.checked)}
+                        />
+                        Has receipt
+                      </label>
+                    </div>
+                  </div>
+                </>
+              ) : null}
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                    Income entries
+                  </p>
+                  <span className="text-xs text-brandGreen/70">
+                    {financeIncomeEntries.length} records
+                  </span>
+                </div>
+                {financeIncomeEntries.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-brandGreen/30 bg-white/80 px-4 py-6 text-sm text-brandGreen/70">
+                    No income entries yet.
+                  </div>
+                ) : (
+                  financeIncomeEntries.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm"
+                    >
+                      <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+                        <div className="space-y-0.5">
+                          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                            Income · {entry.date ?? "-"}
+                          </p>
+                          <p className="text-sm text-brandGreen">
+                            {entry.description || "No description"}
+                          </p>
+                        </div>
+                        <span className="text-lg font-semibold text-emerald-700">
+                          {formatCurrency(Number(entry.amount ?? 0))}
+                        </span>
+                      </div>
+                      {entry.attachmentUrl ? (
+                        <a
+                          href={entry.attachmentUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-2 inline-flex items-center gap-2 text-xs font-semibold text-brandGreen underline decoration-brandGreen/40 underline-offset-4"
+                        >
+                          {entry.attachmentName ?? "View attachment"}
+                        </a>
+                      ) : null}
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                    Expense entries
+                  </p>
+                  <span className="text-xs text-brandGreen/70">
+                    {financeExpenseEntries.length} records
+                  </span>
+                </div>
+                {financeExpenseEntries.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-brandGreen/30 bg-white/80 px-4 py-6 text-sm text-brandGreen/70">
+                    No expenses yet. Record one to keep books balanced.
+                  </div>
+                ) : (
+                  financeExpenseEntries.map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm"
+                    >
+                      <div className="flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
+                        <div className="space-y-0.5">
+                          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                            Expense · {entry.date ?? "-"}
+                          </p>
+                          <p className="text-sm text-brandGreen">
+                            {entry.description || "No description"}
+                          </p>
+                        </div>
+                        <span className="text-lg font-semibold text-red-700">
+                          {formatCurrency(Number(entry.amount ?? 0))}
+                        </span>
+                      </div>
+                      {entry.attachmentUrl ? (
+                        <a
+                          href={entry.attachmentUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="mt-2 inline-flex items-center gap-2 text-xs font-semibold text-brandGreen underline decoration-brandGreen/40 underline-offset-4"
+                        >
+                          {entry.attachmentName ?? "View attachment"}
+                        </a>
+                      ) : null}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
           </div>
         </div>
       )}
 
-      {activeTab === "reports" && (
-        <div className={panelClass}>
-          <h2 className="text-xl font-bold text-brandGreen">Reports</h2>
-          <p className={mutedText}>Quick snapshots of orders, finance, and inventory.</p>
-          <div className="mt-4 grid gap-3 md:grid-cols-3">
-            <div className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
-              <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/60">
-                Total orders
+      {resolvedTab === "reports" && (
+        <div className={`${panelClass} space-y-5`}>
+          <div className="grid gap-4 md:grid-cols-3">
+            <div className="rounded-2xl border border-brandGreen/10 bg-brandBeige/60 p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                Orders
               </p>
-              <p className="text-2xl font-bold text-brandGreen">{ordersSummary.totalOrders}</p>
-            </div>
-            <div className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
-              <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/60">
-                Orders value
-              </p>
-              <p className="text-2xl font-bold text-brandGreen">
-                R{ordersSummary.totalValue.toFixed(2)}
+              <p className="text-3xl font-bold text-brandGreen">{ordersSummary.totalOrders}</p>
+              <p className="text-sm text-brandGreen/70">
+                Total value: {formatCurrency(ordersSummary.totalValue)}
               </p>
             </div>
-            <div className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
-              <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/60">
-                Paid orders
+            <div className="rounded-2xl border border-brandGreen/10 bg-brandBeige/60 p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                Stock
               </p>
-              <p className="text-2xl font-bold text-brandGreen">{ordersSummary.paidCount}</p>
+              <p className="text-3xl font-bold text-brandGreen">{stockSummary.totalItems}</p>
+              <p className="text-sm text-brandGreen/70">Low stock: {stockSummary.lowStock}</p>
+            </div>
+            <div className="rounded-2xl border border-brandGreen/10 bg-brandBeige/60 p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                Finance
+              </p>
+              <p
+                className={`text-3xl font-bold ${
+                  financeSummaryBalance >= 0 ? "text-emerald-700" : "text-red-700"
+                }`}
+              >
+                {formatCurrency(financeSummaryBalance)}
+              </p>
+              <p className="text-xs text-brandGreen/70">
+                Expenses: {formatCurrency(financeSummary.expense)} · Balance:{" "}
+                {formatCurrency(financeSummaryBalance)}
+              </p>
             </div>
           </div>
-          <div className="mt-3 grid gap-3 md:grid-cols-2">
-            <div className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
-              <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/60">
-                Finance summary
-              </p>
-              <p className="text-sm text-brandGreen">Income: R{financeSummary.income.toFixed(2)}</p>
-              <p className="text-sm text-brandGreen">Expense: R{financeSummary.expense.toFixed(2)}</p>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="space-y-3 rounded-2xl border border-brandGreen/10 bg-brandBeige/60 p-4">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                  Order status distribution
+                </p>
+                <span className="text-xs text-brandGreen/70">
+                  {reportOrders.length} orders
+                </span>
+              </div>
+              <div className="space-y-2">
+                {orderStatusDistribution.map((status) => (
+                  <div key={status.id}>
+                    <div className="flex items-center justify-between text-xs text-brandGreen/70">
+                      <span>{status.label ?? status.id}</span>
+                      <span>{status.count}</span>
+                    </div>
+                    <div className="h-2 rounded-full bg-brandGreen/10">
+                      <div
+                        className="h-2 rounded-full bg-brandGreen"
+                        style={{ width: `${status.percent}%` }}
+                      ></div>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
-            <div className="rounded-xl border border-brandGreen/15 bg-white px-4 py-3 shadow-sm">
-              <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/60">
-                Inventory items
+
+            <div className="space-y-3 rounded-2xl border border-brandGreen/10 bg-brandBeige/60 p-4">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                  Finance trend
+                </p>
+                <span className="text-xs text-brandGreen/70">
+                  {financeTrend.length} months
+                </span>
+              </div>
+              <div className="flex items-end justify-between gap-1">
+                {financeTrend.map((entry) => (
+                  <div
+                    key={entry.key}
+                    className="flex flex-col items-center gap-1 text-[0.65rem] text-brandGreen/70"
+                  >
+                    <div className="flex h-28 items-end gap-1">
+                      <div
+                        className="rounded-t-xl bg-emerald-500"
+                        style={{ width: "8px", height: `${entry.incomePercent}%` }}
+                      ></div>
+                      <div
+                        className="rounded-t-xl bg-red-500"
+                        style={{ width: "8px", height: `${entry.expensePercent}%` }}
+                      ></div>
+                    </div>
+                    <span className="text-[0.6rem]">{entry.label}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="flex items-center justify-between text-[0.65rem] text-brandGreen/60">
+                <span className="flex items-center gap-1">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500"></span>Income
+                </span>
+                <span className="flex items-center gap-1">
+                  <span className="h-2 w-2 rounded-full bg-red-500"></span>Expense
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="grid gap-4 lg:grid-cols-2">
+            <div className="space-y-3 rounded-2xl border border-brandGreen/10 bg-brandBeige/60 p-4">
+              <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                Average days in status (since creation)
               </p>
-              <p className="text-sm text-brandGreen">Total items: {stockItems.length}</p>
+              <div className="space-y-2">
+                {orderStatusAverageDays.map((status) => (
+                  <div
+                    key={status.id}
+                    className="flex justify-between text-sm text-brandGreen/70"
+                  >
+                    <span>{status.label ?? status.id}</span>
+                    <span>{status.avgDays.toFixed(1)} days</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="space-y-3 rounded-2xl border border-brandGreen/10 bg-brandBeige/60 p-4">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                  Stock category breakdown
+                </p>
+                <span className="text-xs text-brandGreen/70">
+                  Total quantity: {stockSummary.totalQuantity}
+                </span>
+              </div>
+              <div className="space-y-2">
+                {stockCategoryBreakdown.map((entry) => {
+                  const percent =
+                    stockSummary.totalQuantity === 0
+                      ? 0
+                      : Math.round((entry.quantity / stockSummary.totalQuantity) * 100);
+                  return (
+                    <div key={entry.label}>
+                      <div className="flex items-center justify-between text-xs text-brandGreen/70">
+                        <span>{entry.label}</span>
+                        <span>{entry.quantity}</span>
+                      </div>
+                      <div className="h-2 rounded-full bg-brandGreen/10">
+                        <div
+                          className="h-2 rounded-full bg-brandGreen"
+                          style={{ width: `${percent}%` }}
+                        ></div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-4 rounded-[32px] border-2 border-brandGreen/30 bg-brandBeige/80 p-5 shadow-lg">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-brandGreen/70">
+                  Finance activity
+                </p>
+                <p className="text-base font-semibold text-brandGreen/90">
+                  How well the business is tracking
+                </p>
+              </div>
+              <span className="text-xs text-brandGreen/70">
+                {financeActivity.totalEntries} entries logged
+              </span>
+            </div>
+            <div className="grid gap-3 md:grid-cols-3">
+              <div className="rounded-xl border border-brandGreen/30 bg-white/80 p-3 text-sm">
+                <p className="text-xs uppercase tracking-[0.2em] text-brandGreen/50">Income</p>
+                <p className="text-2xl font-semibold text-emerald-700">
+                  {formatCurrency(financeSummary.income)}
+                </p>
+                <p className="text-xs text-brandGreen/70">
+                  {financeActivity.receipts} receipts attached
+                </p>
+              </div>
+              <div className="rounded-xl border border-brandGreen/30 bg-white/80 p-3 text-sm">
+                <p className="text-xs uppercase tracking-[0.2em] text-brandGreen/50">Expenses</p>
+                <p className="text-2xl font-semibold text-red-700">
+                  {formatCurrency(financeSummary.expense)}
+                </p>
+                <p className="text-xs text-brandGreen/70">
+                  Average {formatCurrency(financeActivity.averageExpense)} per entry
+                </p>
+              </div>
+              <div className="rounded-xl border border-brandGreen/30 bg-white/80 p-3 text-sm">
+                <p className="text-xs uppercase tracking-[0.2em] text-brandGreen/50">
+                  Net balance
+                </p>
+                <p
+                  className={`text-2xl font-semibold ${
+                    financeSummaryBalance >= 0 ? "text-emerald-700" : "text-red-700"
+                  }`}
+                >
+                  {formatCurrency(financeSummaryBalance)}
+                </p>
+                <p className="text-xs text-brandGreen/70">
+                  {financeActivity.recent.length} most recent entries
+                </p>
+              </div>
+            </div>
+            <div className="space-y-2">
+              {financeActivity.recent.map((entry) => {
+                const isExpense = entry.type === "expense";
+                const entryDate =
+                  entry.date ??
+                  resolveFinanceEntryDate(entry)?.toISOString().slice(0, 10) ??
+                  "-";
+                return (
+                  <div
+                    key={entry.id}
+                    className="flex flex-col gap-1 rounded-2xl border border-brandGreen/30 bg-white/90 p-3 shadow-sm"
+                  >
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="flex items-center gap-2 text-brandGreen/70">
+                        <span
+                          className={`h-2.5 w-2.5 rounded-full ${
+                            isExpense ? "bg-red-500" : "bg-emerald-500"
+                          }`}
+                        ></span>
+                        {isExpense ? "Expense" : "Income"}
+                      </span>
+                      <span
+                        className={`font-semibold ${
+                          isExpense ? "text-red-700" : "text-emerald-700"
+                        }`}
+                      >
+                        {formatCurrency(entry.amount ?? 0)}
+                      </span>
+                    </div>
+                    <p className="text-xs text-brandGreen/60">
+                      {entry.description || "Finance entry"} · {entryDate}
+                    </p>
+                  </div>
+                );
+              })}
+              {financeActivity.recent.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-brandGreen/30 bg-white/80 p-3 text-xs text-brandGreen/60">
+                  No finance activity yet.
+                </div>
+              ) : null}
             </div>
           </div>
         </div>
