@@ -344,6 +344,7 @@ const ensureOrderNumber = async (collectionName, orderRef, orderData) => {
 const sendOrderCreatedEmails = async ({ order, collectionName }) => {
   const items = getOrderItems(order);
   const totals = calculateOrderTotals(order);
+  const paidLabel = getPaidLabel(order);
   const name = getCustomerName(order);
   const orderNumber = order.orderNumber || "";
   const orderNumberLabel = orderNumber ? ` ${orderNumber}` : "";
@@ -452,6 +453,7 @@ const sendOrderStatusEmails = async ({ order, previousStatus, nextStatus, collec
   const deliveryLabel = order.deliveryOption || "";
   const sendDate = order.sendDate || "";
   const intro = `Your order status has been updated to ${statusLabel}.`;
+  const paidLabel = getPaidLabel(order);
   const summaryCard = buildOrderSummaryCard({
     heading: "Order summary",
     items,
@@ -472,6 +474,7 @@ const sendOrderStatusEmails = async ({ order, previousStatus, nextStatus, collec
     ${summaryCard}
     ${deliveryLabel ? `<p><strong>Delivery option:</strong> ${escapeHtml(deliveryLabel)}</p>` : ""}
     ${sendDate ? `<p><strong>Send date:</strong> ${escapeHtml(sendDate)}</p>` : ""}
+    <p><strong>Paid:</strong> ${escapeHtml(paidLabel)}</p>
     ${trackingLine}
     <p class="muted">If you have questions, reply to this email.</p>
   `;
@@ -494,6 +497,7 @@ const sendOrderStatusEmails = async ({ order, previousStatus, nextStatus, collec
     <p><strong>New status:</strong> ${escapeHtml(statusLabel)}</p>
     ${trackingLine}
     ${summaryCard}
+    <p><strong>Paid:</strong> ${escapeHtml(paidLabel)}</p>
   `;
 
   const adminHtml = buildEmailHtml({
@@ -832,6 +836,7 @@ exports.sendDispatchEmail = functions.https.onCall(async (data, context) => {
       ${summaryCard}
       ${delivery ? `<p><strong>Delivery option:</strong> ${escapeHtml(delivery)}</p>` : ""}
       ${sendDate ? `<p><strong>Send date:</strong> ${escapeHtml(sendDate)}</p>` : ""}
+      <p><strong>Paid:</strong> ${escapeHtml(paidLabel)}</p>
       ${trackingLine}
       <p class="muted">If you have questions, reply to this email.</p>
     `
