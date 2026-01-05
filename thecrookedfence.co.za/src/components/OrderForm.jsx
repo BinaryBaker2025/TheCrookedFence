@@ -19,6 +19,10 @@ import {
 const cardClass = "bg-brandBeige shadow-lg rounded-2xl border border-brandGreen/10";
 const inputClass =
   "w-full rounded-lg border border-brandGreen/20 bg-white/70 px-4 py-3 text-brandGreen placeholder:text-brandGreen/50 focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30";
+const indemnityText =
+  "NO REFUNDS. We take great care in packaging all eggs to ensure they are shipped as safely as possible. However, once eggs leave our care, we cannot be held responsible for damage that may occur during transit, including cracked eggs. Hatch rates cannot be guaranteed. There are many factors beyond our control - such as handling during shipping, incubation conditions, and environmental variables - that may affect development. As eggs are considered livestock, purchasing hatching eggs involves an inherent risk that the buyer accepts at the time of purchase.";
+const indemnityAcceptanceText =
+  "I have read and accept the indemnity terms.";
 
 const createDefaultForm = (isLivestock) => ({
   name: "",
@@ -69,6 +73,7 @@ export default function OrderForm({ variant = "eggs" }) {
   const [success, setSuccess] = useState("");
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [orderNumber, setOrderNumber] = useState(null);
+  const [indemnityAccepted, setIndemnityAccepted] = useState(false);
 
   useEffect(() => {
     const ref = collection(db, isLivestock ? "livestockTypes" : "eggTypes");
@@ -241,6 +246,9 @@ export default function OrderForm({ variant = "eggs" }) {
     if (selectedItems.length === 0) {
       return `Please order at least one ${itemLabel} (quantities above 0).`;
     }
+    if (!indemnityAccepted) {
+      return "Please accept the indemnity terms to continue.";
+    }
     return "";
   };
 
@@ -323,6 +331,8 @@ export default function OrderForm({ variant = "eggs" }) {
         trackingLink: "",
         notes: form.notes.trim(),
         paid: false,
+        indemnityAccepted: true,
+        indemnityAcceptedAt: serverTimestamp(),
         createdAt: serverTimestamp()
       };
 
@@ -349,6 +359,7 @@ export default function OrderForm({ variant = "eggs" }) {
       setIsModalOpen(true);
       setForm(createDefaultForm(isLivestock));
       setQuantities(items.reduce((acc, item) => ({ ...acc, [item.id]: 0 }), {}));
+      setIndemnityAccepted(false);
     } catch (err) {
       console.error("Order submit error:", err);
       const message =
@@ -724,6 +735,23 @@ export default function OrderForm({ variant = "eggs" }) {
               <span>R{total.toFixed(2)}</span>
             </div>
           </div>
+        </div>
+
+        <div className="rounded-xl border border-brandGreen/15 bg-white/80 px-4 py-3 text-sm text-brandGreen shadow-sm">
+          <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/60">
+            Indemnity
+          </p>
+          <p className="mt-2 text-sm text-brandGreen/80">{indemnityText}</p>
+          <label className="mt-3 flex items-start gap-2 text-sm font-semibold text-brandGreen">
+            <input
+              type="checkbox"
+              className="mt-1 h-4 w-4 rounded border-brandGreen text-brandGreen focus:ring-brandGreen"
+              checked={indemnityAccepted}
+              onChange={(event) => setIndemnityAccepted(event.target.checked)}
+              required
+            />
+            <span>{indemnityAcceptanceText}</span>
+          </label>
         </div>
 
         {error ? (

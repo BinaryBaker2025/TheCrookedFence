@@ -41,6 +41,8 @@ const PAYMENT_DETAILS = {
   accountNumber: "63049448219",
   branchCode: "250655"
 };
+const INDEMNITY_TEXT =
+  "NO REFUNDS. We take great care in packaging all eggs to ensure they are shipped as safely as possible. However, once eggs leave our care, we cannot be held responsible for damage that may occur during transit, including cracked eggs. Hatch rates cannot be guaranteed. There are many factors beyond our control - such as handling during shipping, incubation conditions, and environmental variables - that may affect development. As eggs are considered livestock, purchasing hatching eggs involves an inherent risk that the buyer accepts at the time of purchase.";
 
 const EMAIL_STYLES = `
   body { margin:0; padding:0; background:#f8fafc; color:#0f172a; }
@@ -204,8 +206,18 @@ const buildPaymentSectionHtml = (orderNumber) => {
   `;
 };
 
-const buildOrderSummaryCard = ({ heading, items, totals, collectionName }) => {
+const buildIndemnitySectionHtml = () => `
+  <div class="divider"></div>
+  <h3 style="margin: 0 0 8px;">Indemnity</h3>
+  <p>${escapeHtml(INDEMNITY_TEXT)}</p>
+  <p class="muted">By submitting an order you accept these terms.</p>
+`;
+
+const buildOrderSummaryCard = ({ heading, items, totals, collectionName, paidLabel }) => {
   const itemLabel = collectionName === "livestockOrders" ? "Items" : "Eggs";
+  const paidLine = paidLabel
+    ? `<p><strong>Paid:</strong> ${escapeHtml(paidLabel)}</p>`
+    : "";
   return `
     <div class="summary">
       <h3 style="margin: 0 0 8px;">${escapeHtml(heading)}</h3>
@@ -213,8 +225,21 @@ const buildOrderSummaryCard = ({ heading, items, totals, collectionName }) => {
       <p><strong>${itemLabel} total:</strong> ${formatCurrency(totals.subtotal)}</p>
       <p><strong>Delivery:</strong> ${formatCurrency(totals.delivery)}</p>
       <p class="total">Grand total: ${formatCurrency(totals.total)}</p>
+      ${paidLine}
     </div>
   `;
+};
+
+const buildInvoiceNumber = (order) => {
+  if (order.invoiceNumber) return String(order.invoiceNumber);
+  if (order.orderNumber) {
+    const normalized = String(order.orderNumber).replace("#", "");
+    return `INV-${normalized}`;
+  }
+  if (order.id) {
+    return `INV-${String(order.id).slice(-6).toUpperCase()}`;
+  }
+  return `INV-${Date.now()}`;
 };
 
 const getRoleFromContext = (context) => {
@@ -344,7 +369,6 @@ const ensureOrderNumber = async (collectionName, orderRef, orderData) => {
 const sendOrderCreatedEmails = async ({ order, collectionName }) => {
   const items = getOrderItems(order);
   const totals = calculateOrderTotals(order);
-  const paidLabel = getPaidLabel(order);
   const name = getCustomerName(order);
   const orderNumber = order.orderNumber || "";
   const orderNumberLabel = orderNumber ? ` ${orderNumber}` : "";
@@ -361,7 +385,8 @@ const sendOrderCreatedEmails = async ({ order, collectionName }) => {
     heading: "Your order",
     items,
     totals,
-    collectionName
+    collectionName,
+    paidLabel
   });
 
   const detailLines = `
@@ -369,7 +394,6 @@ const sendOrderCreatedEmails = async ({ order, collectionName }) => {
     ${sendDate ? `<p><strong>Send date:</strong> ${escapeHtml(sendDate)}</p>` : ""}
     ${orderNumber ? `<p><strong>Order number:</strong> ${escapeHtml(orderNumber)}</p>` : ""}
     <p><strong>Status:</strong> ${escapeHtml(statusLabel)}</p>
-    <p><strong>Paid:</strong> ${escapeHtml(paidLabel)}</p>
     ${notes ? `<p><strong>Notes:</strong> ${escapeHtml(notes)}</p>` : ""}
     <p class="muted">If you need to change anything, reply to this email.</p>
     <p class="muted">${escapeHtml(whatsappLine)}</p>
@@ -381,6 +405,7 @@ const sendOrderCreatedEmails = async ({ order, collectionName }) => {
     ${summaryCard}
     ${detailLines}
     ${buildPaymentSectionHtml(orderNumber)}
+    ${buildIndemnitySectionHtml()}
   `;
 
   const customerHtml = buildEmailHtml({
@@ -396,7 +421,8 @@ const sendOrderCreatedEmails = async ({ order, collectionName }) => {
     heading: "Order summary",
     items,
     totals,
-    collectionName
+    collectionName,
+    paidLabel
   });
   const adminBody = `
     <p><strong>Customer:</strong> ${escapeHtml(name)}</p>
@@ -408,7 +434,6 @@ const sendOrderCreatedEmails = async ({ order, collectionName }) => {
     ${sendDate ? `<p><strong>Send date:</strong> ${escapeHtml(sendDate)}</p>` : ""}
     ${orderNumber ? `<p><strong>Order number:</strong> ${escapeHtml(orderNumber)}</p>` : ""}
     <p><strong>Status:</strong> ${escapeHtml(statusLabel)}</p>
-    <p><strong>Paid:</strong> ${escapeHtml(paidLabel)}</p>
     ${notes ? `<p><strong>Notes:</strong> ${escapeHtml(notes)}</p>` : ""}
     <p><strong>Items:</strong></p>
     <ul>${buildItemListHtml(items)}</ul>
@@ -458,7 +483,8 @@ const sendOrderStatusEmails = async ({ order, previousStatus, nextStatus, collec
     heading: "Order summary",
     items,
     totals,
-    collectionName
+    collectionName,
+    paidLabel
   });
 
   const trackingLine = trackingLink
@@ -474,9 +500,9 @@ const sendOrderStatusEmails = async ({ order, previousStatus, nextStatus, collec
     ${summaryCard}
     ${deliveryLabel ? `<p><strong>Delivery option:</strong> ${escapeHtml(deliveryLabel)}</p>` : ""}
     ${sendDate ? `<p><strong>Send date:</strong> ${escapeHtml(sendDate)}</p>` : ""}
-    <p><strong>Paid:</strong> ${escapeHtml(paidLabel)}</p>
     ${trackingLine}
     <p class="muted">If you have questions, reply to this email.</p>
+    ${buildIndemnitySectionHtml()}
   `;
 
   const customerHtml = buildEmailHtml({
@@ -497,7 +523,6 @@ const sendOrderStatusEmails = async ({ order, previousStatus, nextStatus, collec
     <p><strong>New status:</strong> ${escapeHtml(statusLabel)}</p>
     ${trackingLine}
     ${summaryCard}
-    <p><strong>Paid:</strong> ${escapeHtml(paidLabel)}</p>
   `;
 
   const adminHtml = buildEmailHtml({
@@ -811,11 +836,13 @@ exports.sendDispatchEmail = functions.https.onCall(async (data, context) => {
   const trackingLink = normalizeUrl(order.trackingLink || "");
   const items = getOrderItems(order);
   const totals = calculateOrderTotals(order);
+  const paidLabel = getPaidLabel(order);
   const summaryCard = buildOrderSummaryCard({
     heading: "Order summary",
     items,
     totals,
-    collectionName
+    collectionName,
+    paidLabel
   });
 
   const trackingLine = trackingLink
@@ -836,9 +863,9 @@ exports.sendDispatchEmail = functions.https.onCall(async (data, context) => {
       ${summaryCard}
       ${delivery ? `<p><strong>Delivery option:</strong> ${escapeHtml(delivery)}</p>` : ""}
       ${sendDate ? `<p><strong>Send date:</strong> ${escapeHtml(sendDate)}</p>` : ""}
-      <p><strong>Paid:</strong> ${escapeHtml(paidLabel)}</p>
       ${trackingLine}
       <p class="muted">If you have questions, reply to this email.</p>
+      ${buildIndemnitySectionHtml()}
     `
   });
 
@@ -850,6 +877,85 @@ exports.sendDispatchEmail = functions.https.onCall(async (data, context) => {
 
   await orderRef.set(
     { dispatchEmailSentAt: admin.firestore.FieldValue.serverTimestamp() },
+    { merge: true }
+  );
+
+  return { id: result?.data?.id || null };
+});
+
+exports.sendInvoiceEmail = functions.https.onCall(async (data, context) => {
+  requireStaff(context);
+
+  const collectionName = String(data?.collectionName || "").trim();
+  if (!["eggOrders", "livestockOrders"].includes(collectionName)) {
+    throw new functions.https.HttpsError("invalid-argument", "Invalid collection name.");
+  }
+
+  const orderId = String(data?.orderId || "").trim();
+  if (!orderId) {
+    throw new functions.https.HttpsError("invalid-argument", "Order id is required.");
+  }
+
+  const orderRef = db.collection(collectionName).doc(orderId);
+  const orderSnap = await orderRef.get();
+  if (!orderSnap.exists) {
+    throw new functions.https.HttpsError("not-found", "Order not found.");
+  }
+
+  const order = orderSnap.data() || {};
+  const email = String(order.email || "").trim();
+  if (!email) {
+    throw new functions.https.HttpsError("failed-precondition", "Order email is missing.");
+  }
+
+  const invoiceUrl = String(order.invoiceUrl || "").trim();
+  if (!invoiceUrl) {
+    throw new functions.https.HttpsError("failed-precondition", "Invoice has not been generated.");
+  }
+
+  const items = getOrderItems(order);
+  const totals = calculateOrderTotals(order);
+  const name = getCustomerName(order);
+  const paidLabel = getPaidLabel(order);
+  const invoiceNumber = buildInvoiceNumber({ ...order, id: orderSnap.id });
+  const orderTypeLabel = collectionName === "livestockOrders" ? "livestock" : "egg";
+  const intro = `Here is your invoice ${invoiceNumber} from ${BRAND_NAME}.`;
+
+  const summaryCard = buildOrderSummaryCard({
+    heading: "Invoice summary",
+    items,
+    totals,
+    collectionName,
+    paidLabel
+  });
+
+  const body = `
+    <p>Hi ${escapeHtml(name)},</p>
+    <p>Thanks for your ${orderTypeLabel} order. Your invoice is ready.</p>
+    ${summaryCard}
+    <p><strong>Invoice:</strong> <a href="${invoiceUrl}">Download invoice PDF</a></p>
+    ${buildPaymentSectionHtml(order.orderNumber || invoiceNumber)}
+    ${buildIndemnitySectionHtml()}
+  `;
+
+  const html = buildEmailHtml({
+    title: `Invoice ${invoiceNumber}`,
+    intro,
+    preheader: intro,
+    body
+  });
+
+  const result = await sendEmail({
+    to: [email],
+    subject: `Invoice ${invoiceNumber} from ${BRAND_NAME}`,
+    html
+  });
+
+  await orderRef.set(
+    {
+      invoiceNumber,
+      invoiceEmailedAt: admin.firestore.FieldValue.serverTimestamp()
+    },
     { merge: true }
   );
 
@@ -1109,6 +1215,7 @@ exports.sendLegacyCorrectionEmails = functions.https.onCall(async (data, context
       <p>${escapeHtml(message)}</p>
       ${orderNumber ? `<p><strong>Order reference:</strong> ${escapeHtml(orderNumber)}</p>` : ""}
       <p class="muted">If you have questions, reply to this email.</p>
+      ${buildIndemnitySectionHtml()}
     `;
     const html = buildEmailHtml({
       title: subject,

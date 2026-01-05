@@ -1,0 +1,41 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isBootstrapAdmin() {
+      return isSignedIn() &&
+        request.auth.token.email != null &&
+        (
+          request.auth.token.email.toLowerCase() == "bradsgbaker14@gmail.com" ||
+          request.auth.token.email.toLowerCase() == "admin@thecrookedfence.co.za" ||
+          request.auth.token.email.toLowerCase() == "stolschristopher60@gmail.com" ||
+          request.auth.token.email.toLowerCase() == "bradley@binarybaker.co.za"
+        );
+    }
+
+    function isAdmin() {
+      return isSignedIn() &&
+        (
+          request.auth.token.role == "admin" ||
+          request.auth.token.role == "super_admin" ||
+          isBootstrapAdmin()
+        );
+    }
+
+    match /orders/{collection}/{orderId}/{fileName} {
+      allow read, write: if isSignedIn();
+    }
+
+    match /finance/{fileName} {
+      allow read, write: if isAdmin();
+    }
+
+    match /stock_updates/{userId}/{fileName} {
+      allow write: if isSignedIn() && request.auth.uid == userId;
+      allow read: if isAdmin();
+    }
+  }
+}

@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 import {
   getIdTokenResult,
   onAuthStateChanged,
@@ -38,6 +40,22 @@ const inputClass =
   "w-full rounded-lg border border-brandGreen/30 bg-white px-3 py-2 text-brandGreen placeholder:text-brandGreen/50 focus:border-brandGreen focus:outline-none focus:ring-2 focus:ring-brandGreen/30";
 const mutedText = "text-brandGreen/70";
 const STOCK_LOG_LIMIT = 25;
+const INVOICE_BRAND = {
+  name: "The Crooked Fence",
+  email: "stolschristopher60@gmail.com",
+  phone: "082 891 07612",
+  website: "thecrookedfence.co.za"
+};
+const INVOICE_BANK = {
+  bank: "FNB/RMB",
+  accountName: "The Golden Quail",
+  accountType: "Gold Business Account",
+  accountNumber: "63049448219",
+  branchCode: "250655"
+};
+const INVOICE_INDEMNITY =
+  "NO REFUNDS. We take great care in packaging all eggs to ensure they are shipped as safely as possible. However, once eggs leave our care, we cannot be held responsible for damage that may occur during transit, including cracked eggs. Hatch rates cannot be guaranteed. There are many factors beyond our control - such as handling during shipping, incubation conditions, and environmental variables - that may affect development. As eggs are considered livestock, purchasing hatching eggs involves an inherent risk that the buyer accepts at the time of purchase.";
+const INVOICE_LOGO_PATH = "/TCFLogoWhiteBackground.png";
 
 const formatTimestamp = (value) => {
   if (!value) return "-";
@@ -56,6 +74,209 @@ const formatDate = (value) => {
 const formatCurrency = (value) => {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
   return `R${Number(value).toFixed(2)}`;
+};
+
+const toNumber = (value) => {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed)) return parsed;
+  if (typeof value === "string") {
+    const floatParsed = Number.parseFloat(value);
+    if (Number.isFinite(floatParsed)) return floatParsed;
+  }
+  return 0;
+};
+
+const buildInvoiceNumber = (order) => {
+  if (order.invoiceNumber) return String(order.invoiceNumber);
+  if (order.orderNumber) {
+    const normalized = String(order.orderNumber).replace("#", "");
+    return `INV-${normalized}`;
+  }
+  if (order.id) {
+    return `INV-${String(order.id).slice(-6).toUpperCase()}`;
+  }
+  return `INV-${Date.now()}`;
+};
+
+const buildInvoiceLines = (order) => {
+  const items = Array.isArray(order.eggs) ? order.eggs : [];
+  return items
+    .filter((item) => toNumber(item.quantity) > 0)
+    .map((item) => {
+      const quantity = toNumber(item.quantity);
+      const specialPrice = item.specialPrice;
+      const unitPrice =
+        specialPrice === null || specialPrice === undefined || toNumber(specialPrice) === 0
+          ? toNumber(item.price)
+          : toNumber(specialPrice);
+      return {
+        label: item.label ?? item.name ?? "Item",
+        quantity,
+        unitPrice,
+        lineTotal: unitPrice * quantity
+      };
+    });
+};
+
+const loadImageDataUrl = async (src) => {
+  const response = await fetch(src);
+  const blob = await response.blob();
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Unable to read image."));
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(blob);
+  });
+};
+
+const generateInvoicePdf = async ({
+  order,
+  collectionName,
+  eggsTotal,
+  deliveryCost,
+  totalCost,
+  orderFullName,
+  addressText,
+  invoiceNumber,
+  invoiceDateLabel,
+  deliveryLabel,
+  sendDateLabel
+}) => {
+  const doc = new jsPDF({ unit: "pt", format: "a4" });
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const marginX = 40;
+  let cursorY = 40;
+
+  try {
+    const logoData = await loadImageDataUrl(INVOICE_LOGO_PATH);
+    doc.addImage(logoData, "PNG", marginX, cursorY, 56, 56);
+  } catch (err) {
+    // Logo is optional; continue without it.
+  }
+
+  doc.setFontSize(18);
+  doc.setTextColor("#064e3b");
+  doc.text("Invoice", pageWidth - marginX, cursorY + 20, { align: "right" });
+
+  doc.setFontSize(10);
+  doc.setTextColor("#334155");
+  doc.text(`Invoice #: ${invoiceNumber}`, pageWidth - marginX, cursorY + 40, {
+    align: "right"
+  });
+  doc.text(`Date: ${invoiceDateLabel}`, pageWidth - marginX, cursorY + 56, {
+    align: "right"
+  });
+
+  doc.setFontSize(11);
+  doc.setTextColor("#0f172a");
+  const brandTextX = marginX + 70;
+  doc.text(INVOICE_BRAND.name, brandTextX, cursorY + 18);
+  doc.setFontSize(9);
+  doc.setTextColor("#475569");
+  doc.text(`Email: ${INVOICE_BRAND.email}`, brandTextX, cursorY + 34);
+  doc.text(`WhatsApp: ${INVOICE_BRAND.phone}`, brandTextX, cursorY + 48);
+  doc.text(`Website: ${INVOICE_BRAND.website}`, brandTextX, cursorY + 62);
+
+  cursorY += 90;
+
+  doc.setFontSize(11);
+  doc.setTextColor("#064e3b");
+  doc.text("Bill To", marginX, cursorY);
+  doc.setFontSize(10);
+  doc.setTextColor("#334155");
+  const billToLines = doc.splitTextToSize(
+    `${orderFullName || "Customer"}\n${order.email || ""}\n${order.cellphone || ""}`,
+    240
+  );
+  doc.text(billToLines, marginX, cursorY + 16);
+
+  const addressLines = doc.splitTextToSize(addressText || "", 240);
+  doc.text(addressLines, marginX + 260, cursorY + 16);
+
+  cursorY += 80;
+
+  const lineItems = buildInvoiceLines(order);
+  if (lineItems.length === 0) {
+    lineItems.push({
+      label: collectionName === "livestockOrders" ? "Livestock order" : "Egg order",
+      quantity: 1,
+      unitPrice: toNumber(totalCost),
+      lineTotal: toNumber(totalCost)
+    });
+  }
+
+  autoTable(doc, {
+    startY: cursorY,
+    head: [["Item", "Qty", "Unit price", "Line total"]],
+    body: lineItems.map((line) => [
+      line.label,
+      String(line.quantity),
+      formatCurrency(line.unitPrice),
+      formatCurrency(line.lineTotal)
+    ]),
+    styles: { fontSize: 9, textColor: "#334155" },
+    headStyles: { fillColor: "#064e3b", textColor: "#ffffff" },
+    alternateRowStyles: { fillColor: "#f8fafc" },
+    columnStyles: {
+      1: { halign: "right", cellWidth: 50 },
+      2: { halign: "right", cellWidth: 80 },
+      3: { halign: "right", cellWidth: 90 }
+    }
+  });
+
+  const tableY = doc.lastAutoTable?.finalY ?? cursorY;
+  let totalsY = tableY + 16;
+  doc.setFontSize(10);
+  doc.setTextColor("#334155");
+  doc.text(`Subtotal: ${formatCurrency(eggsTotal)}`, pageWidth - marginX, totalsY, {
+    align: "right"
+  });
+  totalsY += 14;
+  doc.text(`Delivery: ${formatCurrency(deliveryCost)}`, pageWidth - marginX, totalsY, {
+    align: "right"
+  });
+  totalsY += 16;
+  doc.setFontSize(12);
+  doc.setTextColor("#064e3b");
+  doc.text(`Total: ${formatCurrency(totalCost)}`, pageWidth - marginX, totalsY, {
+    align: "right"
+  });
+
+  doc.setFontSize(10);
+  doc.setTextColor("#334155");
+  doc.text(`Paid: ${order.paid ? "Yes" : "No"}`, marginX, totalsY);
+
+  totalsY += 24;
+  doc.setFontSize(10);
+  doc.setTextColor("#064e3b");
+  doc.text("Delivery details", marginX, totalsY);
+  doc.setFontSize(9);
+  doc.setTextColor("#334155");
+  doc.text(`Delivery option: ${deliveryLabel || "-"}`, marginX, totalsY + 14);
+  doc.text(`Send date: ${sendDateLabel || "-"}`, marginX, totalsY + 28);
+
+  let paymentY = totalsY + 50;
+  doc.setFontSize(10);
+  doc.setTextColor("#064e3b");
+  doc.text("Payment details", marginX, paymentY);
+  doc.setFontSize(9);
+  doc.setTextColor("#334155");
+  const paymentLines = [
+    `Bank: ${INVOICE_BANK.bank}`,
+    `Account Name: ${INVOICE_BANK.accountName}`,
+    `Account Type: ${INVOICE_BANK.accountType}`,
+    `Account Number: ${INVOICE_BANK.accountNumber}`,
+    `Branch Code: ${INVOICE_BANK.branchCode}`
+  ];
+  doc.text(paymentLines, marginX, paymentY + 14);
+
+  const indemnityY = paymentY + 80;
+  doc.setFontSize(9);
+  doc.setTextColor("#334155");
+  const indemnityLines = doc.splitTextToSize(INVOICE_INDEMNITY, pageWidth - marginX * 2);
+  doc.text(indemnityLines, marginX, indemnityY);
+
+  return doc.output("blob");
 };
 
 const formatDuration = (totalSeconds) => {
@@ -83,16 +304,6 @@ const extractCost = (label) => {
 };
 
 const ORDER_ATTACHMENTS = FINANCE_ATTACHMENTS;
-
-const toNumber = (value) => {
-  const parsed = Number(value);
-  if (Number.isFinite(parsed)) return parsed;
-  if (typeof value === "string") {
-    const floatParsed = Number.parseFloat(value);
-    if (Number.isFinite(floatParsed)) return floatParsed;
-  }
-  return 0;
-};
 
 const resolveStockUpdateQuantity = (draft, currentQuantity) => {
   if (!draft || draft.quantity === "" || draft.quantity === undefined) return currentQuantity;
@@ -4557,6 +4768,9 @@ function OrderDetailModal({
   const [dispatchMessage, setDispatchMessage] = useState("");
   const [dispatchSending, setDispatchSending] = useState(false);
   const [uploadingKey, setUploadingKey] = useState("");
+  const [invoiceMessage, setInvoiceMessage] = useState("");
+  const [invoiceGenerating, setInvoiceGenerating] = useState(false);
+  const [invoiceEmailSending, setInvoiceEmailSending] = useState(false);
 
   const isLivestock = collectionName === "livestockOrders";
   const itemLabelSingular = isLivestock ? "livestock" : "egg";
@@ -4597,6 +4811,7 @@ function OrderDetailModal({
     setDispatchMessage("");
     setInternalNoteMessage("");
     setTrackingMessage("");
+    setInvoiceMessage("");
   }, [order]);
 
   const eggsTotal =
@@ -4772,6 +4987,78 @@ function OrderDetailModal({
     } finally {
       setUploadingKey("");
     }
+  };
+
+  const handleGenerateInvoice = async () => {
+    setInvoiceGenerating(true);
+    setInvoiceMessage("");
+    try {
+      const invoiceNumber = buildInvoiceNumber(order);
+      const invoiceDateLabel = new Date().toLocaleDateString();
+      const deliveryLabel = order.deliveryOption ?? "";
+      const sendDateLabel = order.sendDate ?? "";
+      const pdfBlob = await generateInvoicePdf({
+        order,
+        collectionName,
+        eggsTotal,
+        deliveryCost,
+        totalCost,
+        orderFullName,
+        addressText,
+        invoiceNumber,
+        invoiceDateLabel,
+        deliveryLabel,
+        sendDateLabel
+      });
+
+      const safeInvoiceNumber = invoiceNumber.replace(/[^A-Za-z0-9_-]/g, "");
+      const fileName = `Invoice_${safeInvoiceNumber}.pdf`;
+      const fileRef = storageRef(
+        storage,
+        `orders/${collectionName}/${order.id}/invoice_${Date.now()}_${fileName}`
+      );
+      await uploadBytes(fileRef, pdfBlob, { contentType: "application/pdf" });
+      const url = await getDownloadURL(fileRef);
+      await onUpdate({
+        invoiceUrl: url,
+        invoiceFileName: fileName,
+        invoiceNumber,
+        invoiceCreatedAt: serverTimestamp()
+      });
+      setInvoiceMessage("Invoice generated.");
+    } catch (err) {
+      console.error("invoice generation error", err);
+      setInvoiceMessage("Unable to generate invoice.");
+    } finally {
+      setInvoiceGenerating(false);
+    }
+  };
+
+  const handleSendInvoiceEmail = async () => {
+    if (!order.invoiceUrl) {
+      setInvoiceMessage("Generate an invoice first.");
+      return;
+    }
+    setInvoiceEmailSending(true);
+    setInvoiceMessage("");
+    try {
+      const callable = httpsCallable(functions, "sendInvoiceEmail");
+      await callable({ collectionName, orderId: order.id });
+      setInvoiceMessage("Invoice email sent.");
+    } catch (err) {
+      console.error("send invoice email error", err);
+      setInvoiceMessage("Unable to send invoice email.");
+    } finally {
+      setInvoiceEmailSending(false);
+    }
+  };
+
+  const handleShareInvoice = () => {
+    if (!order.invoiceUrl) return;
+    const label = order.invoiceNumber || order.orderNumber || "invoice";
+    const message = `Here is your ${label} from ${INVOICE_BRAND.name}: ${order.invoiceUrl}`;
+    const link = `https://wa.me/?text=${encodeURIComponent(message)}`;
+    window.open(link, "_blank", "noopener,noreferrer");
   };
 
   const handleDispatchEmail = async () => {
@@ -5024,6 +5311,56 @@ function OrderDetailModal({
               );
             })}
           </div>
+        </div>
+
+        <div className="mt-4 space-y-2 rounded-2xl border border-brandGreen/10 bg-white/70 p-4 shadow-inner">
+          <p className="text-xs font-semibold uppercase tracking-wide text-brandGreen/70">
+            Invoice
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleGenerateInvoice}
+              disabled={invoiceGenerating}
+              className="rounded-full bg-brandGreen px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:shadow-md disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {invoiceGenerating
+                ? "Generating..."
+                : order.invoiceUrl
+                  ? "Regenerate invoice"
+                  : "Generate invoice"}
+            </button>
+            {order.invoiceUrl ? (
+              <>
+                <a
+                  href={order.invoiceUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="rounded-full border border-brandGreen/30 px-4 py-2 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+                >
+                  Download invoice
+                </a>
+                <button
+                  type="button"
+                  onClick={handleSendInvoiceEmail}
+                  disabled={invoiceEmailSending}
+                  className="rounded-full border border-brandGreen/30 px-4 py-2 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {invoiceEmailSending ? "Sending..." : "Email invoice"}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleShareInvoice}
+                  className="rounded-full border border-brandGreen/30 px-4 py-2 text-xs font-semibold text-brandGreen transition hover:bg-brandBeige"
+                >
+                  Share on WhatsApp
+                </button>
+              </>
+            ) : null}
+          </div>
+          {invoiceMessage ? (
+            <p className="text-xs font-semibold text-brandGreen/70">{invoiceMessage}</p>
+          ) : null}
         </div>
 
         <div className="mt-4 grid gap-4 md:grid-cols-2">
